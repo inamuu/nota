@@ -16,12 +16,16 @@ pub const HELP: &[(&str, &str)] = &[
     ("Tab / Shift-Tab", "ビューを順に切り替え"),
     ("h / l", "一覧と本文のフォーカスを移動"),
     ("Enter", "ノートは本文へ、検索は該当箇所へジャンプ"),
-    ("Space", "ToDo の状態を進める（未着手→進行中→完了）"),
+    ("Space", "ToDo / タスクの状態を進める（未着手→進行中→完了）"),
     ("o", "今日のノートに新しいエントリを作る（$EDITOR）"),
-    ("e", "選択中のエントリを編集する（$EDITOR）"),
+    (
+        "e",
+        "エントリ、またはプロジェクトのタスク一覧を編集する（$EDITOR）",
+    ),
     ("D", "エントリを削除する（確認あり）"),
     ("/", "全文検索。Esc で元のビューに戻る"),
     ("a", "ノート一覧を直近だけ / 全件で切り替え"),
+    ("A", "アーカイブ済みプロジェクトの表示を切り替え"),
     ("r", "データを再読み込み"),
     ("?", "このヘルプ"),
     ("q, Ctrl-c", "終了"),
@@ -78,6 +82,7 @@ fn normal_mode(app: &App, key: KeyEvent, ctrl: bool) -> Option<Msg> {
         KeyCode::Char('/') => Some(Msg::SearchStart),
         KeyCode::Char('r') => Some(Msg::Reload),
         KeyCode::Char('a') => Some(Msg::ToggleAllNotes),
+        KeyCode::Char('A') => Some(Msg::ToggleArchived),
         KeyCode::Char('1') => Some(Msg::SwitchView(View::Notes)),
         KeyCode::Char('2') => Some(Msg::SwitchView(View::Todo)),
         KeyCode::Char('3') => Some(Msg::SwitchView(View::Projects)),
@@ -107,7 +112,7 @@ fn normal_mode(app: &App, key: KeyEvent, ctrl: bool) -> Option<Msg> {
             View::Search => Some(Msg::SearchCommit),
             View::Notes => Some(Msg::ToggleFocus),
             View::Todo => Some(Msg::CycleTodo),
-            View::Projects => None,
+            View::Projects => Some(Msg::ToggleFocus),
         },
         // 検索ビューにいるときは Esc で抜ける。それ以外はメッセージを消すだけ。
         KeyCode::Esc if app.view == View::Search => Some(Msg::SearchCancel),
@@ -127,6 +132,7 @@ mod tests {
             data_dir: PathBuf::from("/nonexistent"),
             source: "test".into(),
             recent_notes: 30,
+            project_done_limit: 5,
         };
         App::new(config).expect("空のディレクトリでも起動できる")
     }

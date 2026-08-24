@@ -16,6 +16,8 @@ pub enum EditTarget {
     EntryBody { note_idx: usize, entry_idx: usize },
     /// 今日のノートに新しいエントリを足す。
     NewEntry,
+    /// プロジェクトのタスク一覧をチェックリストとして編集する。
+    ProjectTasks { project_idx: usize },
 }
 
 #[derive(Debug, Clone)]

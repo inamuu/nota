@@ -15,11 +15,14 @@ const USER_CONFIG: &str = "nota/config.toml";
 const FALLBACK_DATA_DIR: &str = "Documents/Acta";
 /// ノート一覧に最初から出す件数。全件は `a` で切り替える。
 const DEFAULT_RECENT_NOTES: usize = 30;
+/// プロジェクトの完了タスクを出す件数。増えすぎると未完が埋もれる。
+const DEFAULT_PROJECT_DONE_LIMIT: usize = 5;
 
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     data_dir: Option<String>,
     recent_notes: Option<usize>,
+    project_done_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +32,8 @@ pub struct Config {
     pub source: String,
     /// ノート一覧に最初から出す件数。0 なら最初から全件。
     pub recent_notes: usize,
+    /// プロジェクトの完了タスクを出す件数。0 なら全件。
+    pub project_done_limit: usize,
 }
 
 impl Config {
@@ -56,7 +61,11 @@ impl Config {
                 return Ok(Self {
                     data_dir: expanded,
                     source: format!("--data-dir または {ENV_DATA_DIR}"),
-                    recent_notes: load_recent_notes(),
+                    recent_notes: load_usize(|f| f.recent_notes, DEFAULT_RECENT_NOTES),
+                    project_done_limit: load_usize(
+                        |f| f.project_done_limit,
+                        DEFAULT_PROJECT_DONE_LIMIT,
+                    ),
                 });
             }
         }
@@ -68,7 +77,11 @@ impl Config {
                 return Ok(Self {
                     data_dir: expanded,
                     source,
-                    recent_notes: load_recent_notes(),
+                    recent_notes: load_usize(|f| f.recent_notes, DEFAULT_RECENT_NOTES),
+                    project_done_limit: load_usize(
+                        |f| f.project_done_limit,
+                        DEFAULT_PROJECT_DONE_LIMIT,
+                    ),
                 });
             }
         }
@@ -114,17 +127,17 @@ impl Config {
     }
 }
 
-/// 表示件数の設定を読む。データディレクトリの解決とは独立に、
+/// 件数の設定を読む。データディレクトリの解決とは独立に、
 /// 最初に値が書かれていた設定ファイルの指定を使う。
-fn load_recent_notes() -> usize {
+fn load_usize(pick: impl Fn(&ConfigFile) -> Option<usize>, default: usize) -> usize {
     for path in config_file_paths() {
         if let Ok(Some(file)) = read_config_file(&path) {
-            if let Some(value) = file.recent_notes {
+            if let Some(value) = pick(&file) {
                 return value;
             }
         }
     }
-    DEFAULT_RECENT_NOTES
+    default
 }
 
 /// 設定ファイルの候補を優先順に返す。

@@ -89,6 +89,8 @@ pub enum Msg {
     Reload,
     /// ノート一覧を直近だけにするか、全件にするか。
     ToggleAllNotes,
+    /// アーカイブ済みのプロジェクトを出すかどうか。
+    ToggleArchived,
     /// 選択中のエントリを $EDITOR で編集する。
     EditEntry,
     /// 今日のノートに新しいエントリを作る。
@@ -154,6 +156,8 @@ pub struct App {
     pub detail_scroll: usize,
     pub todo_sel: usize,
     pub project_sel: usize,
+    /// プロジェクトのタスク一覧のカーソル。
+    pub task_sel: usize,
     pub search_sel: usize,
 
     pub query: String,
@@ -171,6 +175,8 @@ pub struct App {
     pub status: Option<String>,
     /// ノート一覧を全件出しているか。既定は直近だけ。
     pub show_all_notes: bool,
+    /// アーカイブ済みのプロジェクトを出しているか。既定は隠す。
+    pub show_archived: bool,
     pub should_quit: bool,
     /// 直近の描画で本文ペインに収まった行数。ページ移動の幅に使う。
     pub viewport: usize,
@@ -198,6 +204,7 @@ impl App {
             detail_scroll: 0,
             todo_sel: 0,
             project_sel: 0,
+            task_sel: 0,
             search_sel: 0,
             query: String::new(),
             hits: Vec::new(),
@@ -206,6 +213,7 @@ impl App {
             splash: Some(Instant::now() + SPLASH_DURATION),
             status: None,
             show_all_notes: false,
+            show_archived: false,
             should_quit: false,
             viewport: 20,
         };
@@ -238,8 +246,27 @@ impl App {
                 };
             }
             Msg::Move(m) => self.apply_move(m),
-            Msg::CycleTodo => self.cycle_todo(),
+            Msg::CycleTodo => {
+                if self.view == View::Projects {
+                    self.cycle_project_task();
+                } else {
+                    self.cycle_todo();
+                }
+            }
             Msg::Reload => self.reload(),
+            Msg::ToggleArchived => {
+                self.show_archived = !self.show_archived;
+                let len = self.visible_projects().len();
+                if self.project_sel >= len {
+                    self.project_sel = len.saturating_sub(1);
+                }
+                self.task_sel = 0;
+                self.status = Some(if self.show_archived {
+                    format!("アーカイブ済みも表示（{} 件）", self.projects.len())
+                } else {
+                    format!("アーカイブ済みを除外（{} 件）", len)
+                });
+            }
             Msg::ToggleAllNotes => {
                 self.show_all_notes = !self.show_all_notes;
                 // 絞り込みで選択が範囲外になることがある。
@@ -317,6 +344,9 @@ impl App {
                 note_idx,
                 entry_idx,
             } => self.apply_entry_body(note_idx, entry_idx, &text),
+            EditTarget::ProjectTasks { project_idx } => {
+                self.apply_project_tasks(project_idx, &text)
+            }
             EditTarget::NewEntry => {
                 let (tags, body) = crate::editor::decompose(&text);
                 if body.trim().is_empty() {
@@ -375,6 +405,19 @@ impl App {
     }
 
     fn start_edit_entry(&mut self) {
+        // プロジェクトビューではタスク一覧をまとめて編集する。
+        if self.view == View::Projects {
+            let visible = self.visible_projects();
+            let Some(project_idx) = visible.get(self.project_sel).copied() else {
+                self.status = Some("プロジェクトがありません".into());
+                return;
+            };
+            self.pending_edit = Some(EditRequest {
+                target: EditTarget::ProjectTasks { project_idx },
+                initial: self.projects[project_idx].tasks_as_checklist(),
+            });
+            return;
+        }
         let Some((note_idx, entry_idx)) = self.focused_entry() else {
             self.status = Some("編集するエントリがありません".into());
             return;
@@ -389,6 +432,85 @@ impl App {
             },
             initial,
         });
+    }
+
+    /// チェックリストの編集結果を project.json に書く。
+    fn apply_project_tasks(&mut self, project_idx: usize, text: &str) {
+        let tasks = crate::model::parse_checklist(text);
+        let Some(project) = self.projects.get(project_idx) else {
+            return;
+        };
+        // 全部消して保存されたときは、事故を疑って何もしない。
+        if tasks.is_empty() && !project.tasks.is_empty() {
+            self.status = Some("タスクが空になったので変更しませんでした".into());
+            return;
+        }
+        let now = chrono::Local::now().timestamp_millis();
+        if let Err(err) = self.store.save_project_tasks(project, &tasks, now) {
+            self.status = Some(format!("保存に失敗しました: {err}"));
+            return;
+        }
+        self.reload_projects();
+        self.status = Some(format!("タスクを保存しました（{} 件）", tasks.len()));
+    }
+
+    /// プロジェクトだけ読み直す。ノートまで読み直す必要はない。
+    fn reload_projects(&mut self) {
+        match self.store.load_projects() {
+            Ok(projects) => {
+                self.projects = projects;
+                let len = self.visible_projects().len();
+                if self.project_sel >= len {
+                    self.project_sel = len.saturating_sub(1);
+                }
+                let tasks = self.visible_tasks().len();
+                if self.task_sel >= tasks {
+                    self.task_sel = tasks.saturating_sub(1);
+                }
+            }
+            Err(err) => self.status = Some(format!("読み直しに失敗しました: {err}")),
+        }
+    }
+
+    /// プロジェクトのタスクの状態を 1 段進める。
+    fn cycle_project_task(&mut self) {
+        let Some(project) = self.selected_project() else {
+            self.status = Some("プロジェクトがありません".into());
+            return;
+        };
+        let project_idx = self.visible_projects()[self.project_sel];
+        let visible = self.visible_tasks();
+        let Some(target) = visible.get(self.task_sel) else {
+            self.status = Some("タスクがありません".into());
+            return;
+        };
+        let (title, next) = (target.title.clone(), target.status.next());
+
+        // 並びは現在の表示順のまま、対象だけ状態を変える。
+        let mut tasks: Vec<(TaskStatus, String)> = Vec::new();
+        for status in [
+            TaskStatus::InProgress,
+            TaskStatus::Backlog,
+            TaskStatus::Done,
+        ] {
+            for task in project.tasks_with(status) {
+                let status = if task.title == title { next } else { status };
+                tasks.push((status, task.title.clone()));
+            }
+        }
+
+        let now = chrono::Local::now().timestamp_millis();
+        let project = &self.projects[project_idx];
+        if let Err(err) = self.store.save_project_tasks(project, &tasks, now) {
+            self.status = Some(format!("保存に失敗しました: {err}"));
+            return;
+        }
+        self.reload_projects();
+        // 状態が変わると並びが変わる。カーソルは同じタスクを追う。
+        if let Some(at) = self.visible_tasks().iter().position(|t| t.title == title) {
+            self.task_sel = at;
+        }
+        self.status = Some(format!("{title} → {}", next.label()));
     }
 
     fn start_new_entry(&mut self) {
@@ -553,6 +675,16 @@ impl App {
         self.config.recent_notes.min(self.notes.len())
     }
 
+    /// 一覧に出すプロジェクトの添字。既定ではアーカイブ済みを外す。
+    pub fn visible_projects(&self) -> Vec<usize> {
+        self.projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| self.show_archived || !p.is_archived())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn apply_move(&mut self, m: Move) {
         // 本文ペインにフォーカスがあるときはスクロール。それ以外は一覧のカーソル。
         if self.view == View::Notes && self.focus == Focus::Detail {
@@ -560,11 +692,22 @@ impl App {
             self.detail_scroll = shift(self.detail_scroll, m, max, self.viewport);
             return;
         }
+        // プロジェクトビューで本文側にいるときはタスクを選ぶ。
+        if self.view == View::Projects && self.focus == Focus::Detail {
+            let len = self.visible_tasks().len();
+            if len == 0 {
+                self.task_sel = 0;
+                return;
+            }
+            self.task_sel = shift(self.task_sel, m, len - 1, self.viewport);
+            return;
+        }
         let visible = self.visible_notes();
+        let visible_projects = self.visible_projects().len();
         let (sel, len) = match self.view {
             View::Notes => (&mut self.note_sel, visible),
             View::Todo => (&mut self.todo_sel, self.todos.len()),
-            View::Projects => (&mut self.project_sel, self.projects.len()),
+            View::Projects => (&mut self.project_sel, visible_projects),
             View::Search => (&mut self.search_sel, self.hits.len()),
         };
         if len == 0 {
@@ -575,6 +718,9 @@ impl App {
         *sel = shift(*sel, m, len - 1, page);
         if self.view == View::Notes {
             self.detail_scroll = 0;
+        }
+        if self.view == View::Projects {
+            self.task_sel = 0;
         }
     }
 
@@ -756,7 +902,42 @@ impl App {
     }
 
     pub fn selected_project(&self) -> Option<&Project> {
-        self.projects.get(self.project_sel)
+        let visible = self.visible_projects();
+        self.projects.get(*visible.get(self.project_sel)?)
+    }
+
+    /// 右ペインに出すタスク。Done は数を絞る。並びは画面の順と揃える。
+    pub fn visible_tasks(&self) -> Vec<&crate::model::ProjectTask> {
+        let Some(project) = self.selected_project() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for status in [
+            TaskStatus::InProgress,
+            TaskStatus::Backlog,
+            TaskStatus::Done,
+        ] {
+            let tasks = project.tasks_with(status);
+            let shown = if status == TaskStatus::Done && self.config.project_done_limit > 0 {
+                self.config.project_done_limit.min(tasks.len())
+            } else {
+                tasks.len()
+            };
+            out.extend(tasks.into_iter().take(shown));
+        }
+        out
+    }
+
+    /// 表示から省いた Done の件数。
+    pub fn hidden_done(&self) -> usize {
+        let Some(project) = self.selected_project() else {
+            return 0;
+        };
+        let limit = self.config.project_done_limit;
+        if limit == 0 {
+            return 0;
+        }
+        project.count(TaskStatus::Done).saturating_sub(limit)
     }
 
     /// 画面下部に出す集計。

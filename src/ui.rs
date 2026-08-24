@@ -4,7 +4,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Focus, LineKind, Mode, View};
@@ -273,87 +273,101 @@ fn draw_projects(app: &mut App, frame: &mut Frame, area: Rect) {
         .split(area);
     app.viewport = cols[0].height.saturating_sub(2).max(1) as usize;
 
-    let items: Vec<ListItem> = app
-        .projects
+    let visible = app.visible_projects();
+    let items: Vec<ListItem> = visible
         .iter()
-        .map(|p| {
+        .map(|i| {
+            let p = &app.projects[*i];
             let open = p.count(TaskStatus::Backlog) + p.count(TaskStatus::InProgress);
             let mut spans = vec![Span::raw(p.name.clone())];
             if p.is_archived() {
-                spans.push(Span::styled(" (archived)", Style::default().fg(DIM)));
+                spans.push(Span::styled(" 済", Style::default().fg(DIM)));
             }
             spans.push(Span::styled(
-                format!("  未完 {open}"),
+                format!("  {open}"),
                 Style::default().fg(if open > 0 { PROGRESS } else { DIM }),
             ));
             ListItem::new(Line::from(spans))
         })
         .collect();
 
+    let title = if app.show_archived {
+        format!("プロジェクト {}（済も表示）", visible.len())
+    } else {
+        format!("プロジェクト {}", visible.len())
+    };
     let list = List::new(items)
-        .block(bordered("プロジェクト", true))
-        .highlight_style(cursor_style(true))
+        .block(bordered(&title, app.focus == Focus::List))
+        .highlight_style(cursor_style(app.focus == Focus::List))
         .highlight_symbol(CURSOR);
     let mut state = ListState::default();
-    if !app.projects.is_empty() {
+    if !visible.is_empty() {
         state.select(Some(app.project_sel));
     }
     frame.render_stateful_widget(list, cols[0], &mut state);
 
-    let mut lines: Vec<Line> = Vec::new();
-    let title = if let Some(project) = app.selected_project() {
-        if !project.issue_url.is_empty() {
-            lines.push(Line::from(Span::styled(
-                project.issue_url.clone(),
-                Style::default().fg(DIM),
-            )));
-            lines.push(Line::from(""));
-        }
-        for status in [
-            TaskStatus::InProgress,
-            TaskStatus::Backlog,
-            TaskStatus::Done,
-        ] {
-            let tasks: Vec<_> = project
-                .tasks
-                .iter()
-                .filter(|t| t.status == status)
-                .collect();
-            if tasks.is_empty() {
-                continue;
-            }
-            lines.push(Line::from(Span::styled(
-                format!("{} ({})", status.label(), tasks.len()),
-                Style::default()
-                    .fg(match status {
-                        TaskStatus::Done => DONE,
-                        TaskStatus::InProgress => PROGRESS,
-                        TaskStatus::Backlog => ACCENT,
-                    })
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for task in tasks {
-                lines.push(Line::from(format!("  {} {}", status.marker(), task.title)));
-            }
-            lines.push(Line::from(""));
-        }
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "タスクがありません",
-                Style::default().fg(DIM),
-            )));
-        }
-        project.name.clone()
-    } else {
-        "プロジェクトがありません".to_string()
+    let Some(project) = app.selected_project() else {
+        frame.render_widget(
+            Paragraph::new("プロジェクトがありません").block(bordered("タスク", false)),
+            cols[1],
+        );
+        return;
     };
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(bordered(&title, false))
-            .wrap(Wrap { trim: false }),
-        cols[1],
-    );
+    // 状態ごとに並べる。区切りの見出しを挟んで境目を分かりやすくする。
+    let focused = app.focus == Focus::Detail;
+    let mut items: Vec<ListItem> = Vec::new();
+    let visible_tasks = app.visible_tasks();
+    let mut at = 0;
+    for status in [
+        TaskStatus::InProgress,
+        TaskStatus::Backlog,
+        TaskStatus::Done,
+    ] {
+        let count = visible_tasks.iter().filter(|t| t.status == status).count();
+        if count == 0 {
+            continue;
+        }
+        for task in visible_tasks.iter().skip(at).take(count) {
+            let (mark, color) = match status {
+                TaskStatus::Backlog => ("[ ]", Color::Reset),
+                TaskStatus::InProgress => ("[-]", PROGRESS),
+                TaskStatus::Done => ("[x]", DONE),
+            };
+            let title_style = if status == TaskStatus::Done {
+                Style::default().fg(DIM)
+            } else {
+                Style::default()
+            };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!("{mark} "), Style::default().fg(color)),
+                Span::styled(task.title.clone(), title_style),
+            ])));
+        }
+        at += count;
+    }
+
+    let hidden = app.hidden_done();
+    let mut title = project.name.clone();
+    if hidden > 0 {
+        title.push_str(&format!("（完了 他 {hidden} 件）"));
+    }
+    if items.is_empty() {
+        items.push(ListItem::new(Span::styled(
+            "タスクがありません",
+            Style::default().fg(DIM),
+        )));
+    }
+
+    let list = List::new(items)
+        .block(bordered(&title, focused))
+        .highlight_style(cursor_style(focused))
+        .highlight_symbol(CURSOR);
+    let mut state = ListState::default();
+    if focused && !visible_tasks.is_empty() {
+        state.select(Some(app.task_sel));
+    }
+    frame.render_stateful_widget(list, cols[1], &mut state);
 }
 
 fn draw_search(app: &mut App, frame: &mut Frame, area: Rect) {

@@ -87,6 +87,15 @@ impl TaskStatus {
         }
     }
 
+    /// project.json に書く名前。Acta の表記と揃える。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Backlog => "Backlog",
+            Self::InProgress => "InProgress",
+            Self::Done => "Done",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Backlog => "Backlog",
@@ -131,6 +140,9 @@ pub struct Project {
     /// knowledge.md の中身。読み取り専用で保持する。
     #[serde(skip)]
     pub knowledge: String,
+    /// このプロジェクトのディレクトリ。書き戻し先。
+    #[serde(skip)]
+    pub source_dir: PathBuf,
 }
 
 impl Project {
@@ -141,6 +153,35 @@ impl Project {
     pub fn count(&self, status: TaskStatus) -> usize {
         self.tasks.iter().filter(|t| t.status == status).count()
     }
+
+    /// タスクを状態別に取り出す。並びは元のまま。
+    pub fn tasks_with(&self, status: TaskStatus) -> Vec<&ProjectTask> {
+        self.tasks.iter().filter(|t| t.status == status).collect()
+    }
+
+    /// タスク一覧をチェックリストにする。これをエディタで開いて編集する。
+    pub fn tasks_as_checklist(&self) -> String {
+        let mut out = String::new();
+        // 進行中を上に出す。編集するのはたいてい手前のタスク。
+        for status in [
+            TaskStatus::InProgress,
+            TaskStatus::Backlog,
+            TaskStatus::Done,
+        ] {
+            for task in self.tasks_with(status) {
+                out.push_str(&format!("- [{}] {}\n", status.marker(), task.title));
+            }
+        }
+        out
+    }
+}
+
+/// チェックリストを (状態, タイトル) の並びに戻す。解釈できない行は捨てる。
+pub fn parse_checklist(text: &str) -> Vec<(TaskStatus, String)> {
+    text.lines()
+        .filter_map(parse_task_line)
+        .filter(|(_, title)| !title.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Clone, Deserialize)]

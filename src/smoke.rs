@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use crate::app::{App, Confirm, Mode, Move, Msg, View};
+use crate::app::{App, Confirm, Focus, Mode, Move, Msg, View};
 use crate::config::Config;
 use crate::editor::EditTarget;
 
@@ -19,6 +19,7 @@ fn empty_app() -> App {
         data_dir: PathBuf::from("/nonexistent"),
         source: "test".into(),
         recent_notes: 30,
+        project_done_limit: 5,
     })
     .expect("データが無くても起動できる");
     // 起動時のロゴは邪魔なので閉じる。ロゴ自体は専用のテストで見る。
@@ -66,6 +67,7 @@ fn seeded_app(tag: &str, count: usize, recent_notes: usize) -> (App, PathBuf) {
         data_dir: dir.clone(),
         source: "test".into(),
         recent_notes,
+        project_done_limit: 5,
     })
     .expect("起動できる");
     app.dismiss_splash();
@@ -346,6 +348,245 @@ fn footer_shows_the_confirmation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// プロジェクトを持つ一時データを作る。archived は archivedAtMs で表す。
+fn seeded_projects(tag: &str) -> (App, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("nota-pj-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let make = |name: &str, slug: &str, archived: i64, tasks: &str| {
+        let d = dir.join(format!("projects/{slug}"));
+        std::fs::create_dir_all(&d).expect("作れる");
+        let json = format!(
+            r#"{{
+  "id": "id-{slug}",
+  "name": "{name}",
+  "dirName": "{slug}",
+  "createdAtMs": 1,
+  "updatedAtMs": 2,
+  "archivedAtMs": {archived},
+  "issueUrl": "",
+  "tasks": [{tasks}]
+}}"#
+        );
+        std::fs::write(d.join("project.json"), json).expect("書ける");
+    };
+
+    // 未知の項目 sourceType / sourceState を混ぜて、書き戻しで消えないか見る。
+    let tasks = r#"
+    {"id":"t1","title":"進行中のタスク","status":"InProgress","createdAtMs":1,"updatedAtMs":1,"completedAtMs":0,"source":"github","sourceUrl":"u","repository":"r","sourceType":"issue","sourceState":"open"},
+    {"id":"t2","title":"未着手のタスク","status":"Backlog","createdAtMs":1,"updatedAtMs":1,"completedAtMs":0,"source":"local","sourceUrl":"","repository":""},
+    {"id":"t3","title":"完了1","status":"Done","createdAtMs":1,"updatedAtMs":1,"completedAtMs":9,"source":"local","sourceUrl":"","repository":""},
+    {"id":"t4","title":"完了2","status":"Done","createdAtMs":1,"updatedAtMs":1,"completedAtMs":9,"source":"local","sourceUrl":"","repository":""},
+    {"id":"t5","title":"完了3","status":"Done","createdAtMs":1,"updatedAtMs":1,"completedAtMs":9,"source":"local","sourceUrl":"","repository":""}
+  "#;
+    make("現役プロジェクト", "active", 0, tasks);
+    make("終わったプロジェクト", "old", 1_700_000_000_000, "");
+
+    let mut app = App::new(Config {
+        data_dir: dir.clone(),
+        source: "test".into(),
+        recent_notes: 30,
+        project_done_limit: 2,
+    })
+    .expect("起動できる");
+    app.dismiss_splash();
+    app.update(Msg::SwitchView(View::Projects));
+    (app, dir)
+}
+
+fn project_json(dir: &Path, slug: &str) -> serde_json::Value {
+    let text =
+        std::fs::read_to_string(dir.join(format!("projects/{slug}/project.json"))).expect("読める");
+    serde_json::from_str(&text).expect("JSON として読める")
+}
+
+/// アーカイブ済みは既定で出さず、A で出る。
+#[test]
+fn archived_projects_are_hidden_by_default() {
+    let (mut app, dir) = seeded_projects("archived");
+    assert_eq!(app.projects.len(), 2, "読み込み自体は全件");
+    assert_eq!(app.visible_projects().len(), 1, "既定で絞られていない");
+    assert_eq!(
+        app.selected_project().expect("ある").name,
+        "現役プロジェクト"
+    );
+
+    let out = squash(&render(&mut app, 100, 20));
+    assert!(!out.contains("終わったプロジェクト"), "隠れていない");
+
+    app.update(Msg::ToggleArchived);
+    assert_eq!(app.visible_projects().len(), 2);
+    let out = squash(&render(&mut app, 100, 20));
+    assert!(out.contains("終わったプロジェクト"), "出ていない");
+
+    // 末尾を選んでから隠すと、選択が範囲内に戻る。
+    app.update(Msg::Move(Move::Bottom));
+    assert_eq!(app.project_sel, 1);
+    app.update(Msg::ToggleArchived);
+    assert_eq!(app.project_sel, 0, "選択が範囲外に残っている");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 完了タスクは既定で数を絞り、隠した件数を見出しに出す。
+#[test]
+fn done_tasks_are_capped() {
+    let (mut app, dir) = seeded_projects("done");
+    // 進行中 1 + 未着手 1 + 完了 2（上限）。
+    assert_eq!(app.visible_tasks().len(), 4);
+    assert_eq!(app.hidden_done(), 1);
+
+    let out = squash(&render(&mut app, 100, 20));
+    assert!(out.contains("完了他1件"), "隠した件数が出ていない: {out}");
+    assert!(out.contains("完了1") && out.contains("完了2"));
+    assert!(!out.contains("完了3"), "上限を超えて出ている");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 上限 0 は「絞らない」の意味。
+#[test]
+fn zero_done_limit_shows_everything() {
+    let (mut app, dir) = seeded_projects("nolimit");
+    app.config.project_done_limit = 0;
+    assert_eq!(app.visible_tasks().len(), 5);
+    assert_eq!(app.hidden_done(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Space でタスクの状態が進み、project.json に書かれる。未知の項目は残る。
+#[test]
+fn space_cycles_a_project_task() {
+    let (mut app, dir) = seeded_projects("cycle");
+    app.update(Msg::ToggleFocus);
+    assert_eq!(app.focus, Focus::Detail);
+
+    // 先頭は進行中のタスク。次は完了になる。
+    app.update(Msg::CycleTodo);
+    let json = project_json(&dir, "active");
+    let task = json["tasks"]
+        .as_array()
+        .expect("配列")
+        .iter()
+        .find(|t| t["title"] == "進行中のタスク")
+        .expect("ある");
+    assert_eq!(task["status"], "Done");
+    assert!(
+        task["completedAtMs"].as_i64().expect("数値") > 0,
+        "完了時刻が入っていない"
+    );
+    // nota が解釈しない項目も残る。
+    assert_eq!(task["sourceType"], "issue");
+    assert_eq!(task["sourceState"], "open");
+    assert_eq!(task["id"], "t1", "id が入れ替わっている");
+
+    // 並びが変わってもカーソルは同じタスクを追うので、押し続けると一周する。
+    app.update(Msg::CycleTodo);
+    app.update(Msg::CycleTodo);
+    let json = project_json(&dir, "active");
+    let task = json["tasks"]
+        .as_array()
+        .expect("配列")
+        .iter()
+        .find(|t| t["title"] == "進行中のタスク")
+        .expect("ある");
+    assert_eq!(
+        task["status"], "InProgress",
+        "カーソルが別のタスクに移っている"
+    );
+    assert_eq!(task["completedAtMs"], 0, "完了時刻が残っている");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// e でタスク一覧をチェックリストとして編集できる。
+#[test]
+fn editing_project_tasks_as_a_checklist() {
+    let (mut app, dir) = seeded_projects("edit");
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    // 進行中が上に来る。
+    assert!(request.initial.starts_with(
+        "- [-] 進行中のタスク
+"
+    ));
+    assert!(request.initial.contains(
+        "- [ ] 未着手のタスク
+"
+    ));
+    assert!(request.initial.contains(
+        "- [x] 完了1
+"
+    ));
+
+    // 名前の変更、追加、削除をまとめて行う。
+    app.apply_edit(
+        request.target,
+        Some(
+            "- [-] 進行中のタスク
+- [x] 未着手のタスク
+- [ ] 追加したタスク
+- [x] 完了1
+"
+            .to_string(),
+        ),
+    );
+
+    let json = project_json(&dir, "active");
+    let tasks = json["tasks"].as_array().expect("配列");
+    assert_eq!(tasks.len(), 4, "件数が合わない");
+    let titles: Vec<&str> = tasks
+        .iter()
+        .map(|t| t["title"].as_str().expect("文字列"))
+        .collect();
+    assert_eq!(
+        titles,
+        vec![
+            "進行中のタスク",
+            "未着手のタスク",
+            "追加したタスク",
+            "完了1"
+        ]
+    );
+    // 状態の変更が入り、既存タスクは id を保つ。
+    assert_eq!(tasks[1]["status"], "Done");
+    assert_eq!(tasks[1]["id"], "t2");
+    // 追加分には新しい id が振られる。
+    assert_ne!(tasks[2]["id"], serde_json::Value::Null);
+    assert_eq!(tasks[2]["status"], "Backlog");
+    assert_eq!(tasks[2]["source"], "local");
+    // 消した分は残らない。
+    assert!(!titles.contains(&"完了2"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 全部消して保存されたときは変更しない。誤操作でタスクが飛ぶのを防ぐ。
+#[test]
+fn emptying_the_checklist_is_rejected() {
+    let (mut app, dir) = seeded_projects("emptylist");
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(
+        request.target,
+        Some(
+            "
+
+"
+            .to_string(),
+        ),
+    );
+
+    let json = project_json(&dir, "active");
+    assert_eq!(
+        json["tasks"].as_array().expect("配列").len(),
+        5,
+        "消えている"
+    );
+    assert!(app.status.is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// エントリの区切りはペイン幅まで伸びる。
 #[test]
 fn entry_separator_fills_the_pane() {
@@ -370,6 +611,7 @@ fn splash_shows_on_start_and_dismisses() {
         data_dir: PathBuf::from("/nonexistent"),
         source: "test".into(),
         recent_notes: 30,
+        project_done_limit: 5,
     })
     .expect("起動できる");
 
@@ -393,6 +635,7 @@ fn splash_survives_a_tiny_terminal() {
         data_dir: PathBuf::from("/nonexistent"),
         source: "test".into(),
         recent_notes: 30,
+        project_done_limit: 5,
     })
     .expect("起動できる");
     render(&mut app, 20, 4);
