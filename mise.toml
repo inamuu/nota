@@ -1,0 +1,30 @@
+[tools]
+rust = "latest"
+
+[env]
+# Acta のデータディレクトリ。既定は ~/Documents/Acta
+# NOTA_DATA_DIR = "{{env.HOME}}/Documents/Acta"
+
+[tasks.build]
+description = "デバッグビルド"
+run = "cargo build"
+
+[tasks.release]
+description = "リリースビルド"
+run = "cargo build --release"
+
+[tasks.run]
+description = "TUI を起動"
+run = "cargo run"
+
+[tasks.test]
+description = "テスト実行"
+run = "cargo test"
+
+[tasks.lint]
+description = "clippy と fmt チェック"
+run = ["cargo clippy --all-targets -- -D warnings", "cargo fmt --check"]
+
+[tasks.fmt]
+description = "フォーマット適用"
+run = "cargo fmt"

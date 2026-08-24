@@ -1,0 +1,22 @@
+# nota のローカル設定サンプル。
+# このファイルをコピーして使う。コピー先は追跡されない。
+#
+#   cp config.example.toml config.local.toml
+#
+# または、リポジトリの外に置く（推奨。以下が既定の探索先）
+#
+#   ~/.config/nota/config.toml
+#
+# 探索順は次のとおり。最初に見つかったものを使う。
+#   0. コマンドライン引数 --data-dir
+#   1. 環境変数 NOTA_DATA_DIR
+#   2. 環境変数 NOTA_CONFIG が指すファイル
+#   3. ./config.local.toml
+#   4. ~/.config/nota/config.toml
+#   5. ~/Documents/Acta （既定値）
+#
+# --data-dir と NOTA_DATA_DIR は明示指定として扱う。そこにデータが無ければ
+# 別の場所へフォールバックせずエラーになる。
+
+# Acta のデータディレクトリ。posts/ と projects/ を含むディレクトリを指す。
+data_dir = "/path/to/your/Acta"

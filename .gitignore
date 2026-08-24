@@ -1,0 +1,5 @@
+/target
+# ローカル固有の設定（データディレクトリのパスなど）は追跡しない
+config.local.toml
+*.local.toml
+.DS_Store
