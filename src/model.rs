@@ -14,6 +14,8 @@ const OPEN_MARKER: &str = "<!-- acta:comment";
 const CLOSE_MARKER: &str = "<!-- /acta:comment -->";
 const META_END: &str = "-->";
 pub const TODO_TAG: &str = "ToDo";
+/// ToDo のタスク行のインデント。Acta と同じ半角 2 つ。
+pub const TODO_NESTED_INDENT: &str = "  ";
 
 /// デイリーノート 1 ファイル。
 #[derive(Debug, Clone)]
@@ -164,7 +166,7 @@ fn default_status() -> TaskStatus {
 impl DailyNote {
     /// ファイル内容をパースする。解釈できない行も `lines` に残る。
     pub fn parse(date: String, path: PathBuf, text: &str) -> Self {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let normalized = normalize(text);
         // 末尾の空行を数えずに済むよう、分割結果をそのまま持つ。
         // "a\n" は ["a", ""] になり、join で "a\n" に戻る。
         let lines: Vec<String> = normalized.split('\n').map(str::to_string).collect();
@@ -231,6 +233,78 @@ impl DailyNote {
         out
     }
 
+    /// 行を書き換えたあとにエントリの行範囲を作り直す。
+    /// 編集メソッドは必ずこれを通すので、範囲が古いままになることがない。
+    fn reparse(&mut self) {
+        self.entries = parse_entries(&self.lines, &self.date);
+    }
+
+    /// エントリの本文を差し替える。メタ行とマーカーには触らない。
+    pub fn replace_entry_body(&mut self, entry_idx: usize, body: &str) -> bool {
+        let Some(entry) = self.entries.get(entry_idx) else {
+            return false;
+        };
+        let range = entry.body.clone();
+        let replacement: Vec<String> = normalize(body)
+            .trim_end_matches('\n')
+            .split('\n')
+            .map(str::to_string)
+            .collect();
+        self.lines.splice(range, replacement);
+        self.reparse();
+        true
+    }
+
+    /// エントリの本文末尾に 1 行足す。
+    pub fn append_line_to_entry(&mut self, entry_idx: usize, line: &str) -> bool {
+        let Some(entry) = self.entries.get(entry_idx) else {
+            return false;
+        };
+        let at = entry.body.end;
+        self.lines.insert(at, line.to_string());
+        self.reparse();
+        true
+    }
+
+    /// エントリを削除する。Acta と同じく、続く空行もまとめて落とす。
+    pub fn delete_entry(&mut self, entry_idx: usize) -> bool {
+        let Some(entry) = self.entries.get(entry_idx) else {
+            return false;
+        };
+        let start = entry.block.start;
+        let mut end = entry.block.end;
+        while end < self.lines.len() && self.lines[end].trim().is_empty() {
+            end += 1;
+        }
+        // 末尾のエントリを消したときにファイルが改行なしで終わらないようにする。
+        let at_end = end >= self.lines.len();
+        self.lines.drain(start..end);
+        if at_end {
+            self.lines.truncate(start);
+            self.lines.push(String::new());
+        }
+        self.reparse();
+        true
+    }
+
+    /// エントリブロックを末尾に足す。
+    ///
+    /// ブロックの区切りが必ず空行 1 つになるよう、追記前に末尾だけ整える。
+    /// Acta が書いたファイルは空行 2 つで終わっているので、その場合は
+    /// 何も変わらず GUI と同じ並びになる。
+    pub fn append_entry_block(&mut self, block: &str) {
+        let mut text = self.to_text();
+        if !text.is_empty() {
+            while !text.ends_with("\n\n") {
+                text.push('\n');
+            }
+        }
+        text.push_str(block);
+        let lines: Vec<String> = normalize(&text).split('\n').map(str::to_string).collect();
+        self.lines = lines;
+        self.reparse();
+    }
+
     /// タスク行のマーカーを差し替える。行の他の部分には触らない。
     pub fn set_task_status(&mut self, line: usize, status: TaskStatus) -> bool {
         let Some(text) = self.lines.get(line) else {
@@ -244,6 +318,35 @@ impl DailyNote {
         self.lines[line] = chars.into_iter().collect();
         true
     }
+}
+
+fn normalize(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Acta の formatEntryBlock と同じ形。末尾は空行 1 つ。
+pub fn format_entry_block(
+    id: &str,
+    created: &str,
+    created_ms: i64,
+    tags: &[String],
+    body: &str,
+) -> String {
+    let tag_line = tags
+        .iter()
+        .map(|t| t.trim().trim_start_matches(['#', '＃']).to_string())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let clean_body = normalize(body).trim_end().to_string();
+    format!(
+        "<!-- acta:comment\nid: {id}\ncreated: {created}\ncreated_ms: {created_ms}\ntags: {tag_line}\n-->\n{clean_body}\n<!-- /acta:comment -->\n\n"
+    )
+}
+
+/// 1 日分のファイルの初期内容。Acta が新規作成するときと同じ。
+pub fn initial_note_text(date: &str) -> String {
+    format!("# {date}\n\n")
 }
 
 /// `- [x] タイトル` を (状態, タイトル) に分解する。インデントの有無は問わない。
@@ -516,6 +619,131 @@ mod tests {
         );
         assert_eq!(parse_group_line("  - [ ] タスク"), None);
         assert_eq!(parse_group_line("- [ ] タスク"), None);
+    }
+
+    #[test]
+    fn replaces_only_the_target_body() {
+        let mut note = sample();
+        assert!(note.replace_entry_body(1, "書き換えた本文\n2 行目"));
+        let text = note.to_text();
+        // 対象の本文だけが変わる。
+        assert!(text.contains("書き換えた本文\n2 行目\n<!-- /acta:comment -->"));
+        assert!(!text.contains("## なるジョブ CI"));
+        // メタ行と他のエントリは残る。
+        assert!(text.contains("id: def-456"));
+        assert!(text.contains("created_ms: 1772075960974"));
+        assert!(text.contains("# ToDo: 2026/02/26（木）"));
+        assert_eq!(note.entries.len(), 2);
+        // 行範囲が作り直されている。
+        assert_eq!(
+            note.body_of(&note.entries[1]),
+            vec!["書き換えた本文", "2 行目"]
+        );
+    }
+
+    #[test]
+    fn appends_a_line_to_the_body() {
+        let mut note = sample();
+        assert!(note.append_line_to_entry(0, "  - [ ] 追加したタスク"));
+        let items = note.todo_items();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[3].title, "追加したタスク");
+        // 閉じマーカーの前に入る。
+        assert!(note
+            .to_text()
+            .contains("  - [ ] 追加したタスク\n<!-- /acta:comment -->"));
+    }
+
+    #[test]
+    fn deletes_an_entry_with_its_blank_lines() {
+        let mut note = sample();
+        assert!(note.delete_entry(0));
+        assert_eq!(note.entries.len(), 1);
+        let text = note.to_text();
+        assert!(!text.contains("abc-123"));
+        assert!(text.contains("id: def-456"));
+        // 見出しは残り、余分な空行も残らない。
+        assert!(text.starts_with("# 2026-02-26\n\n<!-- acta:comment\nid: def-456"));
+    }
+
+    #[test]
+    fn deleting_the_last_entry_keeps_a_trailing_newline() {
+        let mut note = sample();
+        assert!(note.delete_entry(1));
+        assert_eq!(note.entries.len(), 1);
+        let text = note.to_text();
+        // Acta の形式ではブロックの後に空行が 1 つ入る。
+        assert!(
+            text.ends_with("<!-- /acta:comment -->\n\n"),
+            "末尾が不正: {text:?}"
+        );
+    }
+
+    /// GUI が追記した結果と同じ並びになる。
+    /// 末尾が改行 1 つのファイルでも、ブロックの間に空行が 1 つ入る。
+    #[test]
+    fn appending_keeps_one_blank_line_between_blocks() {
+        let mut note = sample();
+        let block = format_entry_block(
+            "new-id",
+            "2026-02-26 15:00",
+            1772000000000,
+            &["Memo".to_string()],
+            "新しい本文",
+        );
+        note.append_entry_block(&block);
+        assert_eq!(note.entries.len(), 3);
+        let text = note.to_text();
+        assert!(text.contains("<!-- /acta:comment -->\n\n<!-- acta:comment\nid: new-id"));
+        assert!(text.ends_with("新しい本文\n<!-- /acta:comment -->\n\n"));
+        assert_eq!(note.entries[2].tags, vec!["Memo"]);
+    }
+
+    #[test]
+    fn block_format_matches_acta() {
+        let block = format_entry_block(
+            "i",
+            "2026-01-01 09:00",
+            1,
+            &["a".into(), "b".into()],
+            "本文\n",
+        );
+        assert_eq!(
+            block,
+            "<!-- acta:comment\nid: i\ncreated: 2026-01-01 09:00\ncreated_ms: 1\ntags: a, b\n-->\n本文\n<!-- /acta:comment -->\n\n"
+        );
+    }
+
+    #[test]
+    fn block_format_allows_empty_tags() {
+        let block = format_entry_block("i", "2026-01-01", 1, &[], "本文");
+        assert!(block.contains("tags: \n"));
+    }
+
+    /// 追記したブロックを読み直しても壊れない。
+    #[test]
+    fn round_trips_after_appending() {
+        let mut note = DailyNote::parse(
+            "2026-01-01".into(),
+            PathBuf::from("/tmp/x.md"),
+            &initial_note_text("2026-01-01"),
+        );
+        assert!(note.entries.is_empty());
+        note.append_entry_block(&format_entry_block("a", "2026-01-01", 1, &[], "一つ目"));
+        note.append_entry_block(&format_entry_block(
+            "b",
+            "2026-01-01 10:00",
+            2,
+            &[],
+            "二つ目",
+        ));
+        assert_eq!(note.entries.len(), 2);
+
+        let text = note.to_text();
+        let again = DailyNote::parse("2026-01-01".into(), PathBuf::from("/tmp/x.md"), &text);
+        assert_eq!(again.to_text(), text);
+        assert_eq!(again.entries.len(), 2);
+        assert_eq!(again.body_of(&again.entries[0]), vec!["一つ目"]);
     }
 
     /// 実データで見つかった不具合の回帰テスト。

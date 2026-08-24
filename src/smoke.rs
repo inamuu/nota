@@ -5,13 +5,14 @@
 
 #![cfg(test)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use crate::app::{App, Move, Msg, View};
+use crate::app::{App, Confirm, Mode, Move, Msg, Prompt, PromptKind, View};
 use crate::config::Config;
+use crate::editor::EditTarget;
 
 fn empty_app() -> App {
     App::new(Config {
@@ -125,6 +126,264 @@ fn zero_recent_notes_shows_everything() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 1 行入力に文字を送り込む。
+fn type_text(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.update(Msg::PromptInput(c));
+    }
+}
+
+fn note_text(dir: &Path, date: &str) -> String {
+    let (year, rest) = date.split_at(4);
+    let path = dir.join(format!(
+        "posts/{year}/{}/{}/{date}.md",
+        &rest[1..3],
+        &rest[4..6]
+    ));
+    std::fs::read_to_string(path).expect("読める")
+}
+
+/// e で開いたエディタの結果が、本文だけを差し替えてファイルに入る。
+#[test]
+fn editing_an_entry_replaces_only_the_body() {
+    let (mut app, dir) = seeded_app("edit", 2, 30);
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("エディタ要求が出る");
+    assert_eq!(
+        request.target,
+        EditTarget::EntryBody {
+            note_idx: 0,
+            entry_idx: 0
+        }
+    );
+    // 渡されるのは本文だけで、メタ行やマーカーは含まない。
+    assert!(request.initial.contains("- [ ] タスク2"));
+    assert!(!request.initial.contains("acta:comment"));
+    assert!(!request.initial.contains("created_ms"));
+
+    app.apply_edit(request.target, Some("書き換えた本文\n".to_string()));
+    let text = note_text(&dir, "2026-01-02");
+    assert!(text.contains("-->\n書き換えた本文\n<!-- /acta:comment -->"));
+    assert!(text.contains("id: id-2"), "メタ行が失われている");
+    assert!(text.contains("created_ms: 2"));
+    assert!(text.ends_with("\n\n"), "末尾が変わっている");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 変更なしで閉じたときは何も書かない。
+#[test]
+fn closing_the_editor_unchanged_writes_nothing() {
+    let (mut app, dir) = seeded_app("noedit", 1, 30);
+    let before = note_text(&dir, "2026-01-01");
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, None);
+    assert_eq!(note_text(&dir, "2026-01-01"), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 空にして閉じても消さない。誤操作でエントリが飛ぶのを防ぐ。
+#[test]
+fn emptying_the_body_is_rejected() {
+    let (mut app, dir) = seeded_app("empty", 1, 30);
+    let before = note_text(&dir, "2026-01-01");
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some("   \n".to_string()));
+    assert_eq!(note_text(&dir, "2026-01-01"), before);
+    assert!(app.status.is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// o で本文を書くと、タグを聞かれてから今日のノートに追記される。
+#[test]
+fn creating_an_entry_appends_to_today() {
+    let (mut app, dir) = seeded_app("new", 1, 30);
+    app.update(Msg::NewEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    assert_eq!(request.target, EditTarget::NewEntry);
+    assert!(request.initial.is_empty(), "新規は空から始まる");
+
+    app.apply_edit(request.target, Some("新しく書いた本文\n".to_string()));
+    // 本文のあとはタグ入力。
+    assert_eq!(app.mode, Mode::Insert);
+    assert!(matches!(app.prompt, Some(Prompt::NewEntryTags { .. })));
+    type_text(&mut app, "Memo, 検証");
+    app.update(Msg::PromptCommit);
+    assert_eq!(app.mode, Mode::Normal);
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let text = note_text(&dir, &today);
+    assert!(
+        text.starts_with(&format!("# {today}\n\n")),
+        "見出しがない: {text}"
+    );
+    assert!(text.contains("新しく書いた本文"));
+    assert!(text.contains("tags: Memo, 検証"));
+    assert!(text.contains("<!-- /acta:comment -->\n\n"));
+
+    // 読み直しても壊れていない。
+    let note = app.notes.iter().find(|n| n.date == today).expect("ある");
+    assert_eq!(note.entries.len(), 1);
+    assert_eq!(note.to_text(), text);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 本文が空なら作らない。
+#[test]
+fn creating_with_an_empty_body_is_skipped() {
+    let (mut app, dir) = seeded_app("newempty", 1, 30);
+    app.update(Msg::NewEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some("\n  \n".to_string()));
+    assert_eq!(app.mode, Mode::Normal, "タグを聞くところまで進んでいる");
+    assert_eq!(app.notes.len(), 1, "ノートが増えている");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// タグなし（空で確定）でも作れる。
+#[test]
+fn creating_without_tags_works() {
+    let (mut app, dir) = seeded_app("notags", 1, 30);
+    app.update(Msg::NewEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some("タグなしの本文".to_string()));
+    app.update(Msg::PromptCommit);
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let text = note_text(&dir, &today);
+    assert!(text.contains("tags: \n"));
+    assert!(text.contains("タグなしの本文"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// i で 1 行追記できる。
+#[test]
+fn appending_a_line_inline() {
+    let (mut app, dir) = seeded_app("append", 1, 30);
+    app.update(Msg::PromptStart(PromptKind::AppendLine));
+    assert_eq!(app.mode, Mode::Insert);
+    type_text(&mut app, "思いついたこと");
+    app.update(Msg::PromptCommit);
+
+    let text = note_text(&dir, "2026-01-01");
+    assert!(text.contains("思いついたこと\n<!-- /acta:comment -->"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// t で ToDo にタスクを足すと、インデントとチェック欄が付く。
+#[test]
+fn adding_a_task_inline() {
+    let (mut app, dir) = seeded_app("addtask", 1, 30);
+    app.update(Msg::SwitchView(View::Todo));
+    app.update(Msg::PromptStart(PromptKind::AddTask));
+    assert_eq!(app.mode, Mode::Insert);
+    type_text(&mut app, "新しいタスク");
+    app.update(Msg::PromptCommit);
+
+    let text = note_text(&dir, "2026-01-01");
+    assert!(
+        text.contains("  - [ ] 新しいタスク\n"),
+        "書式が違う: {text}"
+    );
+    // ToDo 一覧にも増えている。
+    assert_eq!(app.todos.len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// c はタスク名だけを差し替える。マーカーとインデントは保つ。
+#[test]
+fn renaming_a_task_keeps_the_marker() {
+    let (mut app, dir) = seeded_app("rename", 1, 30);
+    app.update(Msg::SwitchView(View::Todo));
+    app.update(Msg::PromptStart(PromptKind::RenameTask));
+    // 今の名前から編集を始められる。
+    assert_eq!(app.input, "タスク1");
+    app.update(Msg::PromptClear);
+    type_text(&mut app, "変えた名前");
+    app.update(Msg::PromptCommit);
+
+    let text = note_text(&dir, "2026-01-01");
+    assert!(text.contains("  - [ ] 変えた名前\n"), "書式が違う: {text}");
+    assert!(!text.contains("タスク1"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 空の名前は拒否する。
+#[test]
+fn renaming_to_empty_is_rejected() {
+    let (mut app, dir) = seeded_app("renameempty", 1, 30);
+    app.update(Msg::SwitchView(View::Todo));
+    app.update(Msg::PromptStart(PromptKind::RenameTask));
+    app.update(Msg::PromptClear);
+    app.update(Msg::PromptCommit);
+    assert!(note_text(&dir, "2026-01-01").contains("タスク1"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Esc で入力を捨てたら何も書かない。
+#[test]
+fn cancelling_a_prompt_writes_nothing() {
+    let (mut app, dir) = seeded_app("cancel", 1, 30);
+    let before = note_text(&dir, "2026-01-01");
+    app.update(Msg::PromptStart(PromptKind::AppendLine));
+    type_text(&mut app, "捨てる入力");
+    app.update(Msg::PromptCancel);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.input.is_empty());
+    assert_eq!(note_text(&dir, "2026-01-01"), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D は確認を挟む。n なら消さない。
+#[test]
+fn deleting_asks_first() {
+    let (mut app, dir) = seeded_app("delete", 2, 30);
+    let before = note_text(&dir, "2026-01-02");
+    app.update(Msg::DeleteEntry);
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(matches!(app.confirm, Some(Confirm::DeleteEntry { .. })));
+
+    app.update(Msg::ConfirmNo);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(note_text(&dir, "2026-01-02"), before);
+
+    // y なら消える。
+    app.update(Msg::DeleteEntry);
+    app.update(Msg::ConfirmYes);
+    let after = note_text(&dir, "2026-01-02");
+    assert!(
+        !after.contains("acta:comment"),
+        "エントリが残っている: {after}"
+    );
+    assert!(
+        after.starts_with("# 2026-01-02"),
+        "見出しが消えている: {after}"
+    );
+    assert_eq!(app.todos.len(), 1, "ToDo 一覧が更新されていない");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 入力中と確認中は画面下部にそれが出る。
+#[test]
+fn footer_shows_prompt_and_confirmation() {
+    let (mut app, dir) = seeded_app("footer", 1, 30);
+    app.update(Msg::PromptStart(PromptKind::AppendLine));
+    type_text(&mut app, "入力中の文字");
+    let out = squash(&render(&mut app, 100, 20));
+    assert!(out.contains("追記:入力中の文字"), "入力行が出ていない");
+
+    app.update(Msg::PromptCancel);
+    app.update(Msg::DeleteEntry);
+    let out = squash(&render(&mut app, 100, 20));
+    assert!(out.contains("削除しますか"), "確認が出ていない");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// データが空でも全ビューが描画できる。初回起動時に落ちないことの担保。
 #[test]
 fn renders_every_view_without_data() {
@@ -150,8 +409,13 @@ fn survives_tiny_terminal() {
 fn help_popup_shows_keys_and_config_source() {
     let mut app = empty_app();
     app.update(Msg::ToggleHelp);
-    let out = squash(&render(&mut app, 100, 30));
+    let out = squash(&render(&mut app, 110, 34));
     assert!(out.contains("キー操作"), "ヘルプの見出しが出ていない");
+    // 説明が枠で切れていないこと。以前 $EDITOR の行が途切れていた。
+    assert!(
+        out.contains("エントリを作る（$EDITOR）"),
+        "説明が切れている"
+    );
     assert!(out.contains("設定の出どころ"), "設定の出どころが出ていない");
     assert!(
         out.contains("/nonexistent"),
@@ -198,7 +462,15 @@ fn search_narrows_and_clears() {
 #[test]
 #[ignore = "実データが必要"]
 fn reads_real_data() {
-    let config = Config::load(None).expect("データディレクトリを解決できる");
+    let config = match Config::load(None) {
+        Ok(config) => config,
+        Err(err) => {
+            // 設定が無い環境では検証しようがないので、理由を出して終わる。
+            println!("実データが無いので省略します: {err}");
+            println!("NOTA_DATA_DIR=/path/to/Acta cargo test -- --ignored で実行してください");
+            return;
+        }
+    };
     println!(
         "data_dir: {} ({})",
         config.data_dir.display(),

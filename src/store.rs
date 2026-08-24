@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::model::{DailyNote, Project};
+use crate::model::{initial_note_text, DailyNote, Project};
 
 const POSTS_DIR: &str = "posts";
 const PROJECTS_DIR: &str = "projects";
@@ -82,6 +82,57 @@ impl Store {
         std::fs::rename(&tmp, &note.path)
             .with_context(|| format!("置き換えに失敗しました: {}", note.path.display()))?;
         Ok(())
+    }
+}
+
+impl Store {
+    /// その日のノートのパス。Acta と同じ `posts/YYYY/MM/DD/YYYY-MM-DD.md`。
+    pub fn note_path(&self, date: &str) -> Option<PathBuf> {
+        if !is_date(date) {
+            return None;
+        }
+        let (year, rest) = date.split_at(4);
+        let month = &rest[1..3];
+        let day = &rest[4..6];
+        Some(
+            self.data_dir
+                .join(POSTS_DIR)
+                .join(year)
+                .join(month)
+                .join(day)
+                .join(format!("{date}.md")),
+        )
+    }
+
+    /// その日のノートを読む。無ければ見出しだけの中身で作って返す。
+    /// 実際にファイルを作るのは保存のときなので、ここではディスクに触らない。
+    pub fn load_or_create_note(&self, date: &str) -> Result<DailyNote> {
+        let path = self
+            .note_path(date)
+            .with_context(|| format!("日付の形式が不正です: {date}"))?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => initial_note_text(date),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("読み込みに失敗しました: {}", path.display()))
+            }
+        };
+        Ok(DailyNote::parse(date.to_string(), path, &text))
+    }
+
+    /// ノートを保存する。親ディレクトリが無ければ作る。
+    pub fn save_new_note(&self, note: &DailyNote) -> Result<()> {
+        if let Some(parent) = note.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("ディレクトリを作れません: {}", parent.display()))?;
+        }
+        self.save_note(note)
+    }
+
+    /// そのファイルが既にあるか。Acta は初日のエントリだけ created を日付のみにする。
+    pub fn note_exists(&self, date: &str) -> bool {
+        self.note_path(date).map(|p| p.is_file()).unwrap_or(false)
     }
 }
 

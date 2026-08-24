@@ -7,7 +7,10 @@
 use anyhow::Result;
 
 use crate::config::Config;
-use crate::model::{DailyNote, Project, TaskStatus, TodoItem};
+use crate::editor::{EditRequest, EditTarget};
+use crate::model::{
+    format_entry_block, DailyNote, Project, TaskStatus, TodoItem, TODO_NESTED_INDENT,
+};
 use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +40,49 @@ pub enum Mode {
     Normal,
     /// 検索クエリ入力中。
     Search,
+    /// 1 行入力中。何を入力しているかは `App::prompt` が持つ。
+    Insert,
+    /// y / n の確認待ち。
+    Confirm,
     Help,
+}
+
+/// 1 行入力で何をしているか。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prompt {
+    /// エントリの本文末尾に 1 行足す。
+    AppendLine { note_idx: usize, entry_idx: usize },
+    /// ToDo にタスク行を足す。
+    AddTask { note_idx: usize, entry_idx: usize },
+    /// ToDo のタスク名を書き換える。
+    RenameTask { todo_idx: usize },
+    /// 新規エントリのタグ。本文はエディタで書き終えている。
+    NewEntryTags { body: String },
+}
+
+impl Prompt {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::AppendLine { .. } => "追記",
+            Self::AddTask { .. } => "タスク追加",
+            Self::RenameTask { .. } => "タスク名",
+            Self::NewEntryTags { .. } => "タグ（カンマ区切り、空で省略）",
+        }
+    }
+}
+
+/// 確認待ちの操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirm {
+    DeleteEntry { note_idx: usize, entry_idx: usize },
+}
+
+impl Confirm {
+    pub fn question(&self) -> String {
+        match self {
+            Self::DeleteEntry { .. } => "このエントリを削除しますか？ y / n".to_string(),
+        }
+    }
 }
 
 /// ビュー内のフォーカス。左の一覧か、右の本文か。
@@ -70,6 +115,21 @@ pub enum Msg {
     Reload,
     /// ノート一覧を直近だけにするか、全件にするか。
     ToggleAllNotes,
+    /// 選択中のエントリを $EDITOR で編集する。
+    EditEntry,
+    /// 今日のノートに新しいエントリを作る。
+    NewEntry,
+    /// 1 行入力を始める。
+    PromptStart(PromptKind),
+    PromptInput(char),
+    PromptBackspace,
+    PromptClear,
+    PromptCommit,
+    PromptCancel,
+    /// 削除の確認を始める。
+    DeleteEntry,
+    ConfirmYes,
+    ConfirmNo,
     SearchStart,
     SearchInput(char),
     SearchBackspace,
@@ -78,6 +138,14 @@ pub enum Msg {
     SearchCancel,
     ToggleHelp,
     DismissStatus,
+}
+
+/// どの 1 行入力を始めるか。対象は `App` が選択状態から決める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    AppendLine,
+    AddTask,
+    RenameTask,
 }
 
 /// 本文ペインの 1 行。描画とスクロール位置の計算で共用する。
@@ -130,6 +198,15 @@ pub struct App {
     pub query: String,
     pub hits: Vec<SearchHit>,
 
+    /// 1 行入力の内容と用途。Mode::Insert のときだけ入っている。
+    pub prompt: Option<Prompt>,
+    pub input: String,
+    /// 確認待ちの操作。Mode::Confirm のときだけ入っている。
+    pub confirm: Option<Confirm>,
+    /// $EDITOR を開いてほしいという要求。端末を触るのはイベントループの仕事なので、
+    /// ここに置いて main に取り出させる。
+    pending_edit: Option<EditRequest>,
+
     pub status: Option<String>,
     /// ノート一覧を全件出しているか。既定は直近だけ。
     pub show_all_notes: bool,
@@ -159,6 +236,10 @@ impl App {
             search_sel: 0,
             query: String::new(),
             hits: Vec::new(),
+            prompt: None,
+            input: String::new(),
+            confirm: None,
+            pending_edit: None,
             status: None,
             show_all_notes: false,
             should_quit: false,
@@ -230,7 +311,375 @@ impl App {
             Msg::SearchCancel => {
                 self.mode = Mode::Normal;
             }
+
+            Msg::EditEntry => self.start_edit_entry(),
+            Msg::NewEntry => self.start_new_entry(),
+            Msg::PromptStart(kind) => self.start_prompt(kind),
+            Msg::PromptInput(c) => self.input.push(c),
+            Msg::PromptBackspace => {
+                self.input.pop();
+            }
+            Msg::PromptClear => self.input.clear(),
+            Msg::PromptCommit => self.commit_prompt(),
+            Msg::PromptCancel => {
+                self.prompt = None;
+                self.input.clear();
+                self.mode = Mode::Normal;
+            }
+            Msg::DeleteEntry => self.start_delete_entry(),
+            Msg::ConfirmYes => self.apply_confirm(),
+            Msg::ConfirmNo => {
+                self.confirm = None;
+                self.mode = Mode::Normal;
+            }
         }
+    }
+
+    /// 状態行にメッセージを出す。イベントループからも使う。
+    pub fn report(&mut self, message: String) {
+        self.status = Some(message);
+    }
+
+    /// main が取り出してエディタを起動する。取り出したら要求は消える。
+    pub fn take_edit_request(&mut self) -> Option<EditRequest> {
+        self.pending_edit.take()
+    }
+
+    /// エディタから戻ってきた内容を反映する。
+    pub fn apply_edit(&mut self, target: EditTarget, edited: Option<String>) {
+        let Some(text) = edited else {
+            self.status = Some("変更はありません".into());
+            return;
+        };
+        match target {
+            EditTarget::EntryBody {
+                note_idx,
+                entry_idx,
+            } => self.apply_entry_body(note_idx, entry_idx, &text),
+            EditTarget::NewEntry => {
+                if text.trim().is_empty() {
+                    self.status = Some("本文が空なので作成しませんでした".into());
+                    return;
+                }
+                // 本文が決まったので、続けてタグを 1 行で聞く。
+                self.prompt = Some(Prompt::NewEntryTags { body: text });
+                self.input.clear();
+                self.mode = Mode::Insert;
+            }
+        }
+    }
+
+    fn apply_entry_body(&mut self, note_idx: usize, entry_idx: usize, text: &str) {
+        if text.trim().is_empty() {
+            self.status = Some("本文が空のままなので変更しませんでした".into());
+            return;
+        }
+        let Some(note) = self.notes.get_mut(note_idx) else {
+            return;
+        };
+        let before = note.to_text();
+        if !note.replace_entry_body(entry_idx, text) {
+            self.status = Some("エントリが見つかりません".into());
+            return;
+        }
+        self.persist(note_idx, before, "保存しました");
+    }
+
+    /// 保存に失敗したら画面の状態も元に戻す。ファイルと表示を食い違わせない。
+    fn persist(&mut self, note_idx: usize, before: String, success: &str) {
+        let note = &self.notes[note_idx];
+        let result = if note.path.is_file() {
+            self.store.save_note(note)
+        } else {
+            self.store.save_new_note(note)
+        };
+        match result {
+            Ok(()) => {
+                self.rebuild_todos();
+                self.run_search();
+                self.status = Some(success.to_string());
+            }
+            Err(err) => {
+                let note = &mut self.notes[note_idx];
+                let path = note.path.clone();
+                let date = note.date.clone();
+                *note = DailyNote::parse(date, path, &before);
+                self.rebuild_todos();
+                self.status = Some(format!("保存に失敗しました: {err}"));
+            }
+        }
+    }
+
+    fn start_edit_entry(&mut self) {
+        let Some((note_idx, entry_idx)) = self.focused_entry() else {
+            self.status = Some("編集するエントリがありません".into());
+            return;
+        };
+        let note = &self.notes[note_idx];
+        let initial = format!("{}\n", note.body_of(&note.entries[entry_idx]).join("\n"));
+        self.pending_edit = Some(EditRequest {
+            target: EditTarget::EntryBody {
+                note_idx,
+                entry_idx,
+            },
+            initial,
+        });
+    }
+
+    fn start_new_entry(&mut self) {
+        self.pending_edit = Some(EditRequest {
+            target: EditTarget::NewEntry,
+            initial: String::new(),
+        });
+    }
+
+    fn start_delete_entry(&mut self) {
+        let Some((note_idx, entry_idx)) = self.focused_entry() else {
+            self.status = Some("削除するエントリがありません".into());
+            return;
+        };
+        self.confirm = Some(Confirm::DeleteEntry {
+            note_idx,
+            entry_idx,
+        });
+        self.mode = Mode::Confirm;
+    }
+
+    fn apply_confirm(&mut self) {
+        let Some(confirm) = self.confirm.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = Mode::Normal;
+        match confirm {
+            Confirm::DeleteEntry {
+                note_idx,
+                entry_idx,
+            } => {
+                let Some(note) = self.notes.get_mut(note_idx) else {
+                    return;
+                };
+                let before = note.to_text();
+                if !note.delete_entry(entry_idx) {
+                    self.status = Some("エントリが見つかりません".into());
+                    return;
+                }
+                self.detail_scroll = 0;
+                self.persist(note_idx, before, "削除しました");
+            }
+        }
+    }
+
+    fn start_prompt(&mut self, kind: PromptKind) {
+        let prompt = match kind {
+            PromptKind::AppendLine => {
+                self.focused_entry()
+                    .map(|(note_idx, entry_idx)| Prompt::AppendLine {
+                        note_idx,
+                        entry_idx,
+                    })
+            }
+            PromptKind::AddTask => {
+                self.focused_todo_entry()
+                    .map(|(note_idx, entry_idx)| Prompt::AddTask {
+                        note_idx,
+                        entry_idx,
+                    })
+            }
+            PromptKind::RenameTask => (!self.todos.is_empty()).then_some(Prompt::RenameTask {
+                todo_idx: self.todo_sel,
+            }),
+        };
+        let Some(prompt) = prompt else {
+            self.status = Some(match kind {
+                PromptKind::AddTask => "ToDo のエントリを選んでください".into(),
+                PromptKind::RenameTask => "タスクを選んでください".to_string(),
+                PromptKind::AppendLine => "エントリを選んでください".to_string(),
+            });
+            return;
+        };
+        // 書き換えは今の値から始められるようにする。
+        self.input = match &prompt {
+            Prompt::RenameTask { todo_idx } => self
+                .todos
+                .get(*todo_idx)
+                .map(|(_, item)| item.title.clone())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.prompt = Some(prompt);
+        self.mode = Mode::Insert;
+    }
+
+    fn commit_prompt(&mut self) {
+        let Some(prompt) = self.prompt.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let value = self.input.trim().to_string();
+        self.input.clear();
+        self.mode = Mode::Normal;
+
+        match prompt {
+            Prompt::NewEntryTags { body } => self.create_entry(&body, &value),
+            Prompt::AppendLine {
+                note_idx,
+                entry_idx,
+            } => {
+                if value.is_empty() {
+                    self.status = Some("入力がないので追記しませんでした".into());
+                    return;
+                }
+                self.insert_line(note_idx, entry_idx, value);
+            }
+            Prompt::AddTask {
+                note_idx,
+                entry_idx,
+            } => {
+                if value.is_empty() {
+                    self.status = Some("入力がないので追加しませんでした".into());
+                    return;
+                }
+                self.insert_line(
+                    note_idx,
+                    entry_idx,
+                    format!("{TODO_NESTED_INDENT}- [ ] {value}"),
+                );
+            }
+            Prompt::RenameTask { todo_idx } => self.rename_task(todo_idx, &value),
+        }
+    }
+
+    fn insert_line(&mut self, note_idx: usize, entry_idx: usize, line: String) {
+        let Some(note) = self.notes.get_mut(note_idx) else {
+            return;
+        };
+        let before = note.to_text();
+        if !note.append_line_to_entry(entry_idx, &line) {
+            self.status = Some("エントリが見つかりません".into());
+            return;
+        }
+        self.persist(note_idx, before, "追記しました");
+    }
+
+    fn rename_task(&mut self, todo_idx: usize, title: &str) {
+        if title.is_empty() {
+            self.status = Some("空の名前にはできません".into());
+            return;
+        }
+        let Some((note_idx, item)) = self.todos.get(todo_idx).cloned() else {
+            return;
+        };
+        let Some(note) = self.notes.get_mut(note_idx) else {
+            return;
+        };
+        let before = note.to_text();
+        // マーカーとインデントを保ったまま、タイトル部分だけ差し替える。
+        let old = &note.lines[item.line];
+        let Some(head) = old.find("] ").map(|i| i + 2) else {
+            self.status = Some("タスク行の形式が想定と違います".into());
+            return;
+        };
+        note.lines[item.line] = format!("{}{title}", &old[..head]);
+        self.persist(note_idx, before, "タスク名を変更しました");
+    }
+
+    /// 今日のノートに新しいエントリを足す。ファイルが無ければ作る。
+    fn create_entry(&mut self, body: &str, tags: &str) {
+        let now = chrono::Local::now();
+        let date = now.format("%Y-%m-%d").to_string();
+        let exists = self.store.note_exists(&date);
+        // Acta と同じ規則。その日の最初のエントリは日付だけ、以降は時刻も入れる。
+        let created = if exists {
+            now.format("%Y-%m-%d %H:%M").to_string()
+        } else {
+            date.clone()
+        };
+        let tags = crate::model::parse_tags(tags);
+        let block = format_entry_block(
+            &uuid::Uuid::new_v4().to_string(),
+            &created,
+            now.timestamp_millis(),
+            &tags,
+            body,
+        );
+
+        let mut note = match self.store.load_or_create_note(&date) {
+            Ok(note) => note,
+            Err(err) => {
+                self.status = Some(format!("ノートを開けません: {err}"));
+                return;
+            }
+        };
+        note.append_entry_block(&block);
+
+        let result = if exists {
+            self.store.save_note(&note)
+        } else {
+            self.store.save_new_note(&note)
+        };
+        if let Err(err) = result {
+            self.status = Some(format!("保存に失敗しました: {err}"));
+            return;
+        }
+
+        // 一覧に出す位置が変わるので読み直す。
+        self.reload();
+        self.view = View::Notes;
+        self.focus = Focus::Detail;
+        self.note_sel = self.notes.iter().position(|n| n.date == date).unwrap_or(0);
+        if self.note_sel >= self.visible_notes() {
+            self.show_all_notes = true;
+        }
+        // 追加したエントリは末尾なので、そこまでスクロールする。
+        self.detail_scroll = self
+            .detail_lines()
+            .iter()
+            .position(|l| l.entry_idx == self.notes[self.note_sel].entries.len().saturating_sub(1))
+            .unwrap_or(0);
+        self.status = Some("エントリを追加しました".into());
+    }
+
+    /// いま操作対象になっているエントリ。ビューごとに選択の持ち方が違う。
+    fn focused_entry(&self) -> Option<(usize, usize)> {
+        match self.view {
+            View::Notes => {
+                let note = self.notes.get(self.note_sel)?;
+                if note.entries.is_empty() {
+                    return None;
+                }
+                // 本文ペインのスクロール位置にあるエントリを対象にする。
+                let lines = self.detail_lines();
+                let entry_idx = lines
+                    .get(self.detail_scroll.min(lines.len().saturating_sub(1)))
+                    .map(|l| l.entry_idx)
+                    .unwrap_or(0);
+                Some((self.note_sel, entry_idx))
+            }
+            View::Todo => {
+                let (note_idx, item) = self.todos.get(self.todo_sel)?;
+                let note = self.notes.get(*note_idx)?;
+                let entry_idx = note
+                    .entries
+                    .iter()
+                    .position(|e| e.body.contains(&item.line))?;
+                Some((*note_idx, entry_idx))
+            }
+            View::Search => {
+                let hit = self.hits.get(self.search_sel)?;
+                Some((hit.note_idx, hit.entry_idx))
+            }
+            View::Projects => None,
+        }
+    }
+
+    /// タスクを足す先の ToDo エントリ。ToDo ビューでは選択中の行が属するもの、
+    /// ノートビューでは表示中のエントリが ToDo ならそれ。
+    fn focused_todo_entry(&self) -> Option<(usize, usize)> {
+        let (note_idx, entry_idx) = self.focused_entry()?;
+        let note = self.notes.get(note_idx)?;
+        note.is_todo(note.entries.get(entry_idx)?)
+            .then_some((note_idx, entry_idx))
     }
 
     fn switch_view(&mut self, view: View) {

@@ -33,7 +33,7 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
         View::Projects => draw_projects(app, frame, root[1]),
         View::Search => draw_search(app, frame, root[1]),
     }
-    draw_status(app, frame, root[2]);
+    draw_footer(app, frame, root[2]);
 
     if app.mode == Mode::Help {
         draw_help(app, frame, frame.area());
@@ -290,6 +290,39 @@ fn draw_search(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_stateful_widget(list, rows[1], &mut state);
 }
 
+/// 画面下部の 1 行。入力中と確認待ちは、そこに出す。
+fn draw_footer(app: &App, frame: &mut Frame, area: Rect) {
+    if app.mode == Mode::Insert {
+        if let Some(prompt) = &app.prompt {
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{}: ", prompt.label()),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(app.input.clone()),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            let prefix = prompt.label().chars().count() + 2;
+            let x = area.x + prefix as u16 + app.input.chars().count() as u16;
+            frame.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
+            return;
+        }
+    }
+    if app.mode == Mode::Confirm {
+        if let Some(confirm) = &app.confirm {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    confirm.question(),
+                    Style::default().fg(Color::Black).bg(PROGRESS),
+                ))),
+                area,
+            );
+            return;
+        }
+    }
+    draw_status(app, frame, area);
+}
+
 fn draw_status(app: &App, frame: &mut Frame, area: Rect) {
     let line = match &app.status {
         Some(message) => Line::from(Span::styled(
@@ -307,7 +340,7 @@ fn draw_status(app: &App, frame: &mut Frame, area: Rect) {
 fn draw_help(app: &App, frame: &mut Frame, area: Rect) {
     // キー一覧 + 空行 + データディレクトリ 2 行 + 閉じ方 + 枠。
     let height = (HELP.len() + 7).min(area.height as usize) as u16;
-    let width = 62.min(area.width.saturating_sub(2));
+    let width = 76.min(area.width.saturating_sub(2));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,

@@ -4,6 +4,7 @@
 
 mod app;
 mod config;
+mod editor;
 mod keys;
 mod model;
 mod smoke;
@@ -24,6 +25,7 @@ use ratatui::Terminal;
 
 use app::{App, Msg};
 use config::Config;
+use editor::EditRequest;
 
 const USAGE: &str = "\
 nota — Acta のデータをターミナルから読む TUI
@@ -83,6 +85,26 @@ fn main() -> Result<()> {
     result
 }
 
+/// $EDITOR を起動する。端末の制御を一度返し、戻ってきたら画面を作り直す。
+/// エディタが失敗しても TUI に戻れるよう、エラーは状態行に出すだけにする。
+fn edit(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    request: EditRequest,
+) -> Result<()> {
+    restore()?;
+    let result = editor::run(&request.initial, "edit");
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    match result {
+        Ok(edited) => app.apply_edit(request.target, edited),
+        Err(err) => app.report(format!("{err}")),
+    }
+    Ok(())
+}
+
 fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -100,6 +122,12 @@ fn restore() -> Result<()> {
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|frame| ui::draw(app, frame))?;
+
+        // エディタを開く要求があれば、端末を明け渡してから起動する。
+        if let Some(request) = app.take_edit_request() {
+            edit(terminal, app, request)?;
+            continue;
+        }
 
         // ポーリングにしておくと、端末リサイズなども取りこぼさない。
         if !event::poll(Duration::from_millis(200))? {
