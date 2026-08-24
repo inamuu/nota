@@ -20,3 +20,7 @@
 
 # Acta のデータディレクトリ。posts/ と projects/ を含むディレクトリを指す。
 data_dir = "/path/to/your/Acta"
+
+# ノート一覧に最初から出す件数。既定は 30。
+# 0 にすると最初から全件を出す。実行中は `a` で切り替えられる。
+#recent_notes = 30

@@ -61,9 +61,11 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Length(18), Constraint::Min(20)])
         .split(area);
 
+    let visible = app.visible_notes();
     let items: Vec<ListItem> = app
         .notes
         .iter()
+        .take(visible)
         .map(|note| {
             let count = note.entries.len();
             ListItem::new(Line::from(vec![
@@ -73,8 +75,13 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
+    let title = if visible < app.notes.len() {
+        format!("日付 {visible}/{}", app.notes.len())
+    } else {
+        "日付".to_string()
+    };
     let list = List::new(items)
-        .block(bordered("日付", app.focus == Focus::List))
+        .block(bordered(&title, app.focus == Focus::List))
         .highlight_style(cursor_style(app.focus == Focus::List))
         .highlight_symbol("");
     let mut state = ListState::default();

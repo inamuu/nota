@@ -18,6 +18,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("Enter", "ノートは本文へ、検索は該当箇所へジャンプ"),
     ("Space", "ToDo の状態を進める（未着手→進行中→完了）"),
     ("/", "全文検索"),
+    ("a", "ノート一覧を直近だけ / 全件で切り替え"),
     ("r", "データを再読み込み"),
     ("?", "このヘルプ"),
     ("q, Ctrl-c", "終了"),
@@ -64,6 +65,7 @@ fn normal_mode(app: &App, key: KeyEvent, ctrl: bool) -> Option<Msg> {
         KeyCode::Char('?') => Some(Msg::ToggleHelp),
         KeyCode::Char('/') => Some(Msg::SearchStart),
         KeyCode::Char('r') => Some(Msg::Reload),
+        KeyCode::Char('a') => Some(Msg::ToggleAllNotes),
         KeyCode::Char('1') => Some(Msg::SwitchView(View::Notes)),
         KeyCode::Char('2') => Some(Msg::SwitchView(View::Todo)),
         KeyCode::Char('3') => Some(Msg::SwitchView(View::Projects)),
@@ -106,6 +108,7 @@ mod tests {
         let config = Config {
             data_dir: PathBuf::from("/nonexistent"),
             source: "test".into(),
+            recent_notes: 30,
         };
         App::new(config).expect("空のディレクトリでも起動できる")
     }

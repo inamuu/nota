@@ -13,17 +13,22 @@ const ENV_CONFIG: &str = "NOTA_CONFIG";
 const LOCAL_CONFIG: &str = "config.local.toml";
 const USER_CONFIG: &str = "nota/config.toml";
 const FALLBACK_DATA_DIR: &str = "Documents/Acta";
+/// ノート一覧に最初から出す件数。全件は `a` で切り替える。
+const DEFAULT_RECENT_NOTES: usize = 30;
 
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     data_dir: Option<String>,
+    recent_notes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub data_dir: PathBuf,
-    /// 設定の出どころ。起動時に画面下部へ出して、どこを直せばよいか分かるようにする。
+    /// 設定の出どころ。ヘルプ画面に出して、どこを直せばよいか分かるようにする。
     pub source: String,
+    /// ノート一覧に最初から出す件数。0 なら最初から全件。
+    pub recent_notes: usize,
 }
 
 impl Config {
@@ -51,6 +56,7 @@ impl Config {
                 return Ok(Self {
                     data_dir: expanded,
                     source: format!("--data-dir または {ENV_DATA_DIR}"),
+                    recent_notes: load_recent_notes(),
                 });
             }
         }
@@ -62,6 +68,7 @@ impl Config {
                 return Ok(Self {
                     data_dir: expanded,
                     source,
+                    recent_notes: load_recent_notes(),
                 });
             }
         }
@@ -107,6 +114,32 @@ impl Config {
     }
 }
 
+/// 表示件数の設定を読む。データディレクトリの解決とは独立に、
+/// 最初に値が書かれていた設定ファイルの指定を使う。
+fn load_recent_notes() -> usize {
+    for path in config_file_paths() {
+        if let Ok(Some(file)) = read_config_file(&path) {
+            if let Some(value) = file.recent_notes {
+                return value;
+            }
+        }
+    }
+    DEFAULT_RECENT_NOTES
+}
+
+/// 設定ファイルの候補を優先順に返す。
+fn config_file_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(path) = std::env::var(ENV_CONFIG) {
+        if !path.trim().is_empty() {
+            out.push(expand_tilde(&path));
+        }
+    }
+    out.push(PathBuf::from(LOCAL_CONFIG));
+    out.extend(user_config_paths());
+    out
+}
+
 /// Acta のデータディレクトリらしいか。posts/ か projects/ があれば採用する。
 fn looks_like_data_dir(dir: &Path) -> bool {
     dir.join("posts").is_dir() || dir.join("projects").is_dir()
@@ -136,7 +169,7 @@ fn user_config_paths() -> Vec<PathBuf> {
     out
 }
 
-fn read_data_dir(path: &Path) -> Result<Option<String>> {
+fn read_config_file(path: &Path) -> Result<Option<ConfigFile>> {
     if !path.is_file() {
         return Ok(None);
     }
@@ -144,8 +177,12 @@ fn read_data_dir(path: &Path) -> Result<Option<String>> {
         .with_context(|| format!("設定ファイルを読めません: {}", path.display()))?;
     let parsed: ConfigFile = toml::from_str(&text)
         .with_context(|| format!("設定ファイルの書式が不正です: {}", path.display()))?;
-    Ok(parsed
-        .data_dir
+    Ok(Some(parsed))
+}
+
+fn read_data_dir(path: &Path) -> Result<Option<String>> {
+    Ok(read_config_file(path)?
+        .and_then(|file| file.data_dir)
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty()))
 }

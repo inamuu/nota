@@ -68,6 +68,8 @@ pub enum Msg {
     /// ToDo のチェック状態を 1 段進める。
     CycleTodo,
     Reload,
+    /// ノート一覧を直近だけにするか、全件にするか。
+    ToggleAllNotes,
     SearchStart,
     SearchInput(char),
     SearchBackspace,
@@ -129,6 +131,8 @@ pub struct App {
     pub hits: Vec<SearchHit>,
 
     pub status: Option<String>,
+    /// ノート一覧を全件出しているか。既定は直近だけ。
+    pub show_all_notes: bool,
     pub should_quit: bool,
     /// 直近の描画で本文ペインに収まった行数。ページ移動の幅に使う。
     pub viewport: usize,
@@ -156,6 +160,7 @@ impl App {
             query: String::new(),
             hits: Vec::new(),
             status: None,
+            show_all_notes: false,
             should_quit: false,
             viewport: 20,
         };
@@ -190,6 +195,20 @@ impl App {
             Msg::Move(m) => self.apply_move(m),
             Msg::CycleTodo => self.cycle_todo(),
             Msg::Reload => self.reload(),
+            Msg::ToggleAllNotes => {
+                self.show_all_notes = !self.show_all_notes;
+                // 絞り込みで選択が範囲外になることがある。
+                let len = self.visible_notes();
+                if self.note_sel >= len {
+                    self.note_sel = len.saturating_sub(1);
+                    self.detail_scroll = 0;
+                }
+                self.status = Some(if self.show_all_notes {
+                    format!("全 {} 件を表示", self.notes.len())
+                } else {
+                    format!("直近 {} 件を表示", self.visible_notes())
+                });
+            }
             Msg::SearchStart => {
                 self.view = View::Search;
                 self.mode = Mode::Search;
@@ -231,6 +250,14 @@ impl App {
         self.switch_view(View::ALL[next]);
     }
 
+    /// ノート一覧に出す件数。notes は日付降順なので先頭から数えればよい。
+    pub fn visible_notes(&self) -> usize {
+        if self.show_all_notes || self.config.recent_notes == 0 {
+            return self.notes.len();
+        }
+        self.config.recent_notes.min(self.notes.len())
+    }
+
     fn apply_move(&mut self, m: Move) {
         // 本文ペインにフォーカスがあるときはスクロール。それ以外は一覧のカーソル。
         if self.view == View::Notes && self.focus == Focus::Detail {
@@ -238,8 +265,9 @@ impl App {
             self.detail_scroll = shift(self.detail_scroll, m, max, self.viewport);
             return;
         }
+        let visible = self.visible_notes();
         let (sel, len) = match self.view {
-            View::Notes => (&mut self.note_sel, self.notes.len()),
+            View::Notes => (&mut self.note_sel, visible),
             View::Todo => (&mut self.todo_sel, self.todos.len()),
             View::Projects => (&mut self.project_sel, self.projects.len()),
             View::Search => (&mut self.search_sel, self.hits.len()),
@@ -295,7 +323,8 @@ impl App {
     }
 
     fn clamp_all(&mut self) {
-        clamp(&mut self.note_sel, self.notes.len());
+        let visible = self.visible_notes();
+        clamp(&mut self.note_sel, visible);
         clamp(&mut self.todo_sel, self.todos.len());
         clamp(&mut self.project_sel, self.projects.len());
         clamp(&mut self.search_sel, self.hits.len());
@@ -351,6 +380,10 @@ impl App {
         self.view = View::Notes;
         self.mode = Mode::Normal;
         self.focus = Focus::Detail;
+        // 絞り込みの外にあるノートなら、黙って選べないので全件表示にする。
+        if hit.note_idx >= self.visible_notes() {
+            self.show_all_notes = true;
+        }
         self.note_sel = hit.note_idx;
         self.detail_scroll = self.entry_offset(hit.note_idx, hit.entry_idx);
     }
@@ -438,12 +471,13 @@ impl App {
             .filter(|(_, t)| t.status != TaskStatus::Done)
             .count();
         let active = self.projects.iter().filter(|p| !p.is_archived()).count();
-        format!(
-            "ノート {} / ToDo 未完 {} / プロジェクト {}",
-            self.notes.len(),
-            open,
-            active
-        )
+        let visible = self.visible_notes();
+        let notes = if visible < self.notes.len() {
+            format!("ノート {}/{}", visible, self.notes.len())
+        } else {
+            format!("ノート {}", self.notes.len())
+        };
+        format!("{notes} / ToDo 未完 {open} / プロジェクト {active}")
     }
 }
 
