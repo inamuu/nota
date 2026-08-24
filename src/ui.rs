@@ -4,7 +4,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Focus, LineKind, Mode, View};
@@ -15,8 +15,25 @@ const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 const DONE: Color = Color::Green;
 const PROGRESS: Color = Color::Yellow;
+/// 選択行の左に出すマーカー。行頭が揃うので目で追いやすい。
+const CURSOR: &str = "▌ ";
+
+/// 起動時のロゴ。
+const LOGO: [&str; 6] = [
+    "███╗   ██╗  ██████╗  ████████╗  █████╗ ",
+    "████╗  ██║ ██╔═══██╗ ╚══██╔══╝ ██╔══██╗",
+    "██╔██╗ ██║ ██║   ██║    ██║    ███████║",
+    "██║╚██╗██║ ██║   ██║    ██║    ██╔══██║",
+    "██║ ╚████║ ╚██████╔╝    ██║    ██║  ██║",
+    "╚═╝  ╚═══╝  ╚═════╝     ╚═╝    ╚═╝  ╚═╝",
+];
 
 pub fn draw(app: &mut App, frame: &mut Frame) {
+    if app.splash_visible() {
+        draw_splash(app, frame, frame.area());
+        return;
+    }
+
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -40,19 +57,93 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     }
 }
 
+/// 起動直後のロゴ。読み込んだ件数も出して、どのデータを開いたか分かるようにする。
+fn draw_splash(app: &App, frame: &mut Frame, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    // 縦位置を中央に寄せる。ロゴ 6 行 + 説明 5 行を目安にする。
+    let content = LOGO.len() + 6;
+    for _ in 0..area.height.saturating_sub(content as u16) / 2 {
+        lines.push(Line::from(""));
+    }
+    for row in LOGO {
+        lines.push(Line::from(Span::styled(
+            row,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "Acta のデータをターミナルから  v{}",
+            env!("CARGO_PKG_VERSION")
+        ),
+        Style::default().fg(DIM),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        app.summary(),
+        Style::default().fg(Color::Reset),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "? キー操作   何かキーを押して開始",
+        Style::default().fg(DIM),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
+        area,
+    );
+}
+
 fn draw_tabs(app: &App, frame: &mut Frame, area: Rect) {
-    let selected = View::ALL.iter().position(|v| *v == app.view).unwrap_or(0);
-    let titles: Vec<Line> = View::ALL.iter().map(|v| Line::from(v.title())).collect();
-    let tabs = Tabs::new(titles)
-        .select(selected)
-        .style(Style::default().fg(DIM))
-        .highlight_style(
+    // タブは自前で組む。選択中を塗って、他は沈める。
+    let mut spans = vec![Span::raw(" ")];
+    for view in View::ALL {
+        let selected = view == app.view;
+        spans.push(Span::styled(
+            format!(" {} ", view.title()),
+            if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM)
+            },
+        ));
+        spans.push(Span::raw(" "));
+    }
+    // 右端にモードを出す。今どの状態かが常に見える。
+    // 文字数ではなく領域を分けて右寄せする。全角が混ざると桁数と表示幅がずれる。
+    let mode = match app.mode {
+        Mode::Normal => None,
+        Mode::Search => Some(("SEARCH", ACCENT)),
+        Mode::Confirm => Some(("CONFIRM", PROGRESS)),
+        Mode::Help => Some(("HELP", DONE)),
+    };
+    let Some((label, color)) = mode else {
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    };
+
+    let badge = format!(" {label} ");
+    let width = badge.chars().count() as u16;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(width)])
+        .split(area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            badge,
             Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        )
-        .divider(" ");
-    frame.render_widget(tabs, area);
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        cols[1],
+    );
 }
 
 fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -70,7 +161,7 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
             let count = note.entries.len();
             ListItem::new(Line::from(vec![
                 Span::raw(note.date.clone()),
-                Span::styled(format!(" {count}"), Style::default().fg(DIM)),
+                Span::styled(format!("  {count}"), Style::default().fg(DIM)),
             ]))
         })
         .collect();
@@ -83,7 +174,7 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
     let list = List::new(items)
         .block(bordered(&title, app.focus == Focus::List))
         .highlight_style(cursor_style(app.focus == Focus::List))
-        .highlight_symbol("");
+        .highlight_symbol(CURSOR);
     let mut state = ListState::default();
     if !app.notes.is_empty() {
         state.select(Some(app.note_sel));
@@ -98,10 +189,22 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
         .selected_note()
         .map(|n| n.date.clone())
         .unwrap_or_else(|| "ノートがありません".into());
+    // エントリの区切りはペイン幅まで伸ばす。境界がひと目で分かる。
+    let inner_width = cols[1].width.saturating_sub(2) as usize;
     let lines: Vec<Line> = app
         .detail_lines()
         .into_iter()
-        .map(|l| Line::from(Span::styled(l.text, style_for(l.kind))))
+        .map(|l| {
+            let span = Span::styled(l.text, style_for(l.kind));
+            if l.kind != LineKind::Header {
+                return Line::from(span);
+            }
+            let rest = inner_width.saturating_sub(span.width() + 1);
+            Line::from(vec![
+                span,
+                Span::styled(format!(" {}", "─".repeat(rest)), Style::default().fg(DIM)),
+            ])
+        })
         .collect();
     let total = lines.len();
     let scroll = app.detail_scroll.min(total.saturating_sub(1)) as u16;
@@ -146,7 +249,8 @@ fn draw_todo(app: &mut App, frame: &mut Frame, area: Rect) {
     let title = format!("ToDo  {} 件  Space で状態を進める", app.todos.len());
     let list = List::new(items)
         .block(bordered(&title, true))
-        .highlight_style(cursor_style(true));
+        .highlight_style(cursor_style(true))
+        .highlight_symbol(CURSOR);
     let mut state = ListState::default();
     if !app.todos.is_empty() {
         state.select(Some(app.todo_sel));
@@ -180,7 +284,8 @@ fn draw_projects(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let list = List::new(items)
         .block(bordered("プロジェクト", true))
-        .highlight_style(cursor_style(true));
+        .highlight_style(cursor_style(true))
+        .highlight_symbol(CURSOR);
     let mut state = ListState::default();
     if !app.projects.is_empty() {
         state.select(Some(app.project_sel));
@@ -282,7 +387,8 @@ fn draw_search(app: &mut App, frame: &mut Frame, area: Rect) {
     };
     let list = List::new(items)
         .block(bordered(&title, !editing))
-        .highlight_style(cursor_style(true));
+        .highlight_style(cursor_style(true))
+        .highlight_symbol(CURSOR);
     let mut state = ListState::default();
     if !app.hits.is_empty() {
         state.select(Some(app.search_sel));
@@ -292,22 +398,6 @@ fn draw_search(app: &mut App, frame: &mut Frame, area: Rect) {
 
 /// 画面下部の 1 行。入力中と確認待ちは、そこに出す。
 fn draw_footer(app: &App, frame: &mut Frame, area: Rect) {
-    if app.mode == Mode::Insert {
-        if let Some(prompt) = &app.prompt {
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("{}: ", prompt.label()),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(app.input.clone()),
-            ]);
-            frame.render_widget(Paragraph::new(line), area);
-            let prefix = prompt.label().chars().count() + 2;
-            let x = area.x + prefix as u16 + app.input.chars().count() as u16;
-            frame.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
-            return;
-        }
-    }
     if app.mode == Mode::Confirm {
         if let Some(confirm) = &app.confirm {
             frame.render_widget(
@@ -403,11 +493,9 @@ fn bordered(title: &str, focused: bool) -> Block<'static> {
 
 fn cursor_style(focused: bool) -> Style {
     if focused {
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().bg(Color::Black)
+        Style::default().add_modifier(Modifier::BOLD)
     }
 }
 

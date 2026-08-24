@@ -135,6 +135,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
         }
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // 最初のキーでロゴを閉じる。そのキー自体は通常どおり処理する。
+                app.dismiss_splash();
                 if let Some(msg) = keys::handle(app, key) {
                     let quit = matches!(msg, Msg::Quit);
                     app.update(msg);

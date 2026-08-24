@@ -14,8 +14,6 @@ const OPEN_MARKER: &str = "<!-- acta:comment";
 const CLOSE_MARKER: &str = "<!-- /acta:comment -->";
 const META_END: &str = "-->";
 pub const TODO_TAG: &str = "ToDo";
-/// ToDo のタスク行のインデント。Acta と同じ半角 2 つ。
-pub const TODO_NESTED_INDENT: &str = "  ";
 
 /// デイリーノート 1 ファイル。
 #[derive(Debug, Clone)]
@@ -255,13 +253,22 @@ impl DailyNote {
         true
     }
 
-    /// エントリの本文末尾に 1 行足す。
-    pub fn append_line_to_entry(&mut self, entry_idx: usize, line: &str) -> bool {
+    /// メタ行の tags を差し替える。行が無ければメタ行の末尾に足す。
+    pub fn set_entry_tags(&mut self, entry_idx: usize, tags: &[String]) -> bool {
         let Some(entry) = self.entries.get(entry_idx) else {
             return false;
         };
-        let at = entry.body.end;
-        self.lines.insert(at, line.to_string());
+        // メタ行は開きマーカーの次から `-->` の直前まで。
+        let start = entry.block.start + 1;
+        let end = entry.body.start.saturating_sub(1);
+        if start > end {
+            return false;
+        }
+        let line = format!("tags: {}", tags.join(", "));
+        match (start..end).find(|i| self.lines[*i].trim_start().starts_with("tags:")) {
+            Some(at) => self.lines[at] = line,
+            None => self.lines.insert(end, line),
+        }
         self.reparse();
         true
     }
@@ -639,19 +646,6 @@ mod tests {
             note.body_of(&note.entries[1]),
             vec!["書き換えた本文", "2 行目"]
         );
-    }
-
-    #[test]
-    fn appends_a_line_to_the_body() {
-        let mut note = sample();
-        assert!(note.append_line_to_entry(0, "  - [ ] 追加したタスク"));
-        let items = note.todo_items();
-        assert_eq!(items.len(), 4);
-        assert_eq!(items[3].title, "追加したタスク");
-        // 閉じマーカーの前に入る。
-        assert!(note
-            .to_text()
-            .contains("  - [ ] 追加したタスク\n<!-- /acta:comment -->"));
     }
 
     #[test]

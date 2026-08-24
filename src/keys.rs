@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, Focus, Mode, Move, Msg, PromptKind, View};
+use crate::app::{App, Focus, Mode, Move, Msg, View};
 
 /// キーバインド一覧。ヘルプ画面がこの配列を描画するので、実装と説明がずれない。
 pub const HELP: &[(&str, &str)] = &[
@@ -19,11 +19,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("Space", "ToDo の状態を進める（未着手→進行中→完了）"),
     ("o", "今日のノートに新しいエントリを作る（$EDITOR）"),
     ("e", "選択中のエントリを編集する（$EDITOR）"),
-    ("i", "エントリに 1 行追記する"),
-    ("t", "ToDo にタスクを 1 行追加する"),
-    ("c", "ToDo のタスク名を変更する"),
     ("D", "エントリを削除する（確認あり）"),
-    ("/", "全文検索"),
+    ("/", "全文検索。Esc で元のビューに戻る"),
     ("a", "ノート一覧を直近だけ / 全件で切り替え"),
     ("r", "データを再読み込み"),
     ("?", "このヘルプ"),
@@ -45,21 +42,8 @@ pub fn handle(app: &App, key: KeyEvent) -> Option<Msg> {
             _ => Some(Msg::ToggleHelp),
         },
         Mode::Search => search_mode(key, ctrl),
-        Mode::Insert => insert_mode(key, ctrl),
         Mode::Confirm => confirm_mode(key),
         Mode::Normal => normal_mode(app, key, ctrl),
-    }
-}
-
-/// 1 行入力中。検索と同じ操作感にしてある。
-fn insert_mode(key: KeyEvent, ctrl: bool) -> Option<Msg> {
-    match key.code {
-        KeyCode::Esc => Some(Msg::PromptCancel),
-        KeyCode::Enter => Some(Msg::PromptCommit),
-        KeyCode::Backspace => Some(Msg::PromptBackspace),
-        KeyCode::Char('u') if ctrl => Some(Msg::PromptClear),
-        KeyCode::Char(c) if !ctrl => Some(Msg::PromptInput(c)),
-        _ => None,
     }
 }
 
@@ -116,9 +100,6 @@ fn normal_mode(app: &App, key: KeyEvent, ctrl: bool) -> Option<Msg> {
 
         KeyCode::Char('o') => Some(Msg::NewEntry),
         KeyCode::Char('e') => Some(Msg::EditEntry),
-        KeyCode::Char('i') => Some(Msg::PromptStart(PromptKind::AppendLine)),
-        KeyCode::Char('t') => Some(Msg::PromptStart(PromptKind::AddTask)),
-        KeyCode::Char('c') => Some(Msg::PromptStart(PromptKind::RenameTask)),
         KeyCode::Char('D') => Some(Msg::DeleteEntry),
 
         KeyCode::Char(' ') => Some(Msg::CycleTodo),
@@ -128,6 +109,8 @@ fn normal_mode(app: &App, key: KeyEvent, ctrl: bool) -> Option<Msg> {
             View::Todo => Some(Msg::CycleTodo),
             View::Projects => None,
         },
+        // 検索ビューにいるときは Esc で抜ける。それ以外はメッセージを消すだけ。
+        KeyCode::Esc if app.view == View::Search => Some(Msg::SearchCancel),
         KeyCode::Esc => Some(Msg::DismissStatus),
         _ => None,
     }

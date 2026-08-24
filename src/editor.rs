@@ -25,6 +25,33 @@ pub struct EditRequest {
     pub initial: String,
 }
 
+/// エディタに渡す形。1 行目がタグで、空行のあとが本文。
+///
+/// メタ行そのものを見せると `created_ms` や閉じマーカーを壊せてしまうので、
+/// 人が触ってよいタグだけを 1 行に出す。
+pub fn compose(tags: &[String], body: &str) -> String {
+    format!("tags: {}\n\n{}", tags.join(", "), body.trim_end())
+}
+
+/// エディタから戻ってきた内容を (タグ, 本文) に分ける。
+///
+/// 1 行目が `tags:` ならタグとして取り込み、続く空行 1 つを区切りとして落とす。
+/// タグ行を消して保存したときは、タグなしの本文として扱う。
+pub fn decompose(text: &str) -> (Vec<String>, String) {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let Some(rest) = normalized.strip_prefix("tags:") else {
+        return (Vec::new(), normalized.trim_end().to_string());
+    };
+    let (tag_line, body) = match rest.split_once('\n') {
+        Some((tag_line, body)) => (tag_line, body),
+        None => (rest, ""),
+    };
+    let tags = crate::model::parse_tags(tag_line);
+    // 区切りの空行は 1 つだけ落とす。本文側の空行は保つ。
+    let body = body.strip_prefix('\n').unwrap_or(body);
+    (tags, body.trim_end().to_string())
+}
+
 /// `$EDITOR` を起動して、編集後の内容を返す。
 ///
 /// 端末の制御は呼び出し側が外しておくこと。内容が変わらなければ `None`。
@@ -109,6 +136,54 @@ fn temp_path(tag: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composes_tags_and_body() {
+        assert_eq!(
+            compose(&["a".into(), "b".into()], "本文\n2 行目\n"),
+            "tags: a, b\n\n本文\n2 行目"
+        );
+        assert_eq!(compose(&[], "本文"), "tags: \n\n本文");
+    }
+
+    #[test]
+    fn decomposes_tags_and_body() {
+        let (tags, body) = decompose("tags: a, b\n\n本文\n2 行目\n");
+        assert_eq!(tags, vec!["a", "b"]);
+        assert_eq!(body, "本文\n2 行目");
+    }
+
+    /// タグ行を消して保存したらタグなしとして扱う。
+    #[test]
+    fn decomposes_without_a_tag_line() {
+        let (tags, body) = decompose("本文だけ\n");
+        assert!(tags.is_empty());
+        assert_eq!(body, "本文だけ");
+    }
+
+    #[test]
+    fn decomposes_empty_tag_line() {
+        let (tags, body) = decompose("tags: \n\n本文");
+        assert!(tags.is_empty());
+        assert_eq!(body, "本文");
+    }
+
+    /// 本文の中の空行は保つ。区切りとして落とすのは 1 つだけ。
+    #[test]
+    fn keeps_blank_lines_inside_the_body() {
+        let (_, body) = decompose("tags: x\n\n一段落\n\n二段落");
+        assert_eq!(body, "一段落\n\n二段落");
+    }
+
+    /// 組み立てて分解すると元に戻る。
+    #[test]
+    fn round_trips_through_the_editor_format() {
+        let tags = vec!["ToDo".to_string(), "Terraform".to_string()];
+        let body = "# 見出し\n\n- 項目";
+        let (back_tags, back_body) = decompose(&compose(&tags, body));
+        assert_eq!(back_tags, tags);
+        assert_eq!(back_body, body);
+    }
 
     #[test]
     fn splits_editor_arguments() {
