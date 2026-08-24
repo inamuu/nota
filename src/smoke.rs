@@ -399,6 +399,21 @@ fn splash_survives_a_tiny_terminal() {
     render(&mut app, 8, 2);
 }
 
+/// ヘッダーも他のペインと同じ枠に入る。
+#[test]
+fn header_is_a_framed_menu() {
+    let (mut app, dir) = seeded_app("menu", 1, 30);
+    let screen = render(&mut app, 100, 20);
+    let top = screen.lines().next().expect("1 行目がある");
+    assert!(top.contains("Menu"), "Menu の見出しがない: {top}");
+    assert!(top.starts_with('┌'), "枠になっていない: {top}");
+    // タブは枠の中に入る。
+    let second = screen.lines().nth(1).expect("2 行目がある");
+    assert!(second.starts_with('│'), "枠の中にない: {second}");
+    assert!(squash(second).contains("ノート"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 今の状態がタブ行の右端に出る。
 #[test]
 fn mode_badge_appears_in_the_tab_row() {

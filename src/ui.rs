@@ -37,7 +37,7 @@ pub fn draw(app: &mut App, frame: &mut Frame) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
@@ -97,6 +97,14 @@ fn draw_splash(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_tabs(app: &App, frame: &mut Frame, area: Rect) {
+    // 他のペインと同じ枠に入れる。
+    let block = bordered("Menu", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
     // タブは自前で組む。選択中を塗って、他は沈める。
     let mut spans = vec![Span::raw(" ")];
     for view in View::ALL {
@@ -123,7 +131,7 @@ fn draw_tabs(app: &App, frame: &mut Frame, area: Rect) {
         Mode::Help => Some(("HELP", DONE)),
     };
     let Some((label, color)) = mode else {
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.render_widget(Paragraph::new(Line::from(spans)), inner);
         return;
     };
 
@@ -132,7 +140,7 @@ fn draw_tabs(app: &App, frame: &mut Frame, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(width)])
-        .split(area);
+        .split(inner);
     frame.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
