@@ -17,6 +17,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("h / l", "一覧と本文のフォーカスを移動"),
     ("Enter", "ノートは本文へ、検索は該当箇所へジャンプ"),
     ("Space", "ToDo / タスクの状態を進める（未着手→進行中→完了）"),
+    ("t", "今日の ToDo を開く。無ければ進行中のタスクから作る"),
     ("o", "今日のノートに新しいエントリを作る（$EDITOR）"),
     (
         "e",
@@ -103,6 +104,7 @@ fn normal_mode(app: &App, key: KeyEvent, ctrl: bool) -> Option<Msg> {
         KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::List => Some(Msg::ToggleFocus),
         KeyCode::Char('h') | KeyCode::Left if app.focus == Focus::Detail => Some(Msg::ToggleFocus),
 
+        KeyCode::Char('t') => Some(Msg::TodayTodo),
         KeyCode::Char('o') => Some(Msg::NewEntry),
         KeyCode::Char('e') => Some(Msg::EditEntry),
         KeyCode::Char('D') => Some(Msg::DeleteEntry),

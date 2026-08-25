@@ -14,6 +14,8 @@ const OPEN_MARKER: &str = "<!-- acta:comment";
 const CLOSE_MARKER: &str = "<!-- /acta:comment -->";
 const META_END: &str = "-->";
 pub const TODO_TAG: &str = "ToDo";
+/// ToDo のタスク行のインデント。Acta と同じ半角 2 つ。
+const TODO_NESTED_INDENT: &str = "  ";
 
 /// デイリーノート 1 ファイル。
 #[derive(Debug, Clone)]
@@ -392,6 +394,40 @@ pub fn format_entry_block(
     )
 }
 
+const WEEKDAY_JA: [&str; 7] = ["日", "月", "火", "水", "木", "金", "土"];
+
+/// ToDo エントリの見出し。Acta と同じ `ToDo: 2026/08/25（月）` の形。
+pub fn todo_heading(date: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let weekday = WEEKDAY_JA[date.weekday().num_days_from_sunday() as usize];
+    format!(
+        "{TODO_TAG}: {:04}/{:02}/{:02}（{weekday}）",
+        date.year(),
+        date.month(),
+        date.day()
+    )
+}
+
+/// 進行中のタスクから ToDo の本文を組み立てる。Acta の
+/// buildTodoBodyFromProjectGroups と同じ並び。
+pub fn build_todo_body(date: chrono::NaiveDate, groups: &[(&str, Vec<&ProjectTask>)]) -> String {
+    let mut lines = vec![format!("# {}", todo_heading(date))];
+    for (name, tasks) in groups {
+        if tasks.is_empty() {
+            continue;
+        }
+        lines.push(format!("- {name}"));
+        for task in tasks {
+            lines.push(format!(
+                "{TODO_NESTED_INDENT}- [{}] {}",
+                task.status.marker(),
+                task.title
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 /// 1 日分のファイルの初期内容。Acta が新規作成するときと同じ。
 pub fn initial_note_text(date: &str) -> String {
     format!("# {date}\n\n")
@@ -634,6 +670,43 @@ mod tests {
         assert_eq!(TaskStatus::Backlog.next(), TaskStatus::InProgress);
         assert_eq!(TaskStatus::InProgress.next(), TaskStatus::Done);
         assert_eq!(TaskStatus::Done.next(), TaskStatus::Backlog);
+    }
+
+    #[test]
+    fn builds_the_todo_heading() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 25).expect("日付");
+        assert_eq!(todo_heading(date), "ToDo: 2026/08/25（火）");
+    }
+
+    #[test]
+    fn builds_a_todo_body_from_tasks() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 25).expect("日付");
+        let task = ProjectTask {
+            id: "x".into(),
+            title: "進行中の作業".into(),
+            status: TaskStatus::InProgress,
+            updated_at_ms: 0,
+        };
+        let body = build_todo_body(date, &[("プロジェクト", vec![&task]), ("空", vec![])]);
+        assert_eq!(
+            body,
+            "# ToDo: 2026/08/25（火）\n- プロジェクト\n  - [-] 進行中の作業"
+        );
+        // 読み直すとタスクとして拾える。
+        let text = format!(
+            "<!-- acta:comment\nid: x\ncreated: 2026-08-25\ncreated_ms: 1\ntags: ToDo\n-->\n{body}\n<!-- /acta:comment -->\n"
+        );
+        let note = DailyNote::parse("2026-08-25".into(), PathBuf::from("/tmp/x.md"), &text);
+        let items = note.todo_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].group, "プロジェクト");
+        assert_eq!(items[0].status, TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn builds_a_heading_only_body_without_tasks() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 25).expect("日付");
+        assert_eq!(build_todo_body(date, &[]), "# ToDo: 2026/08/25（火）");
     }
 
     #[test]

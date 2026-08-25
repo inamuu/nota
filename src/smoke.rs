@@ -400,6 +400,100 @@ fn project_json(dir: &Path, slug: &str) -> serde_json::Value {
     serde_json::from_str(&text).expect("JSON として読める")
 }
 
+/// t は進行中のタスクを並べた雛形を出す。
+#[test]
+fn t_builds_todays_todo_from_in_progress_tasks() {
+    let (mut app, dir) = seeded_projects("todo");
+    app.update(Msg::TodayTodo);
+    let request = app.take_edit_request().expect("要求が出る");
+    assert_eq!(request.target, EditTarget::NewEntry);
+
+    let today = chrono::Local::now().date_naive();
+    let heading = crate::model::todo_heading(today);
+    assert!(
+        request.initial.starts_with("tags: ToDo\n\n"),
+        "ToDo タグが入っていない: {}",
+        request.initial
+    );
+    assert!(
+        request.initial.contains(&format!("# {heading}")),
+        "見出しがない"
+    );
+    // 進行中のタスクだけが並ぶ。未着手と完了は入らない。
+    assert!(request
+        .initial
+        .contains("- 現役プロジェクト\n  - [-] 進行中のタスク"));
+    assert!(!request.initial.contains("未着手のタスク"));
+    assert!(!request.initial.contains("完了1"));
+    // アーカイブ済みのプロジェクトは対象外。
+    assert!(!request.initial.contains("終わったプロジェクト"));
+
+    // そのまま保存すると今日のノートに入る。
+    app.apply_edit(request.target, Some(request.initial.clone()));
+    let date = today.format("%Y-%m-%d").to_string();
+    let text = note_text(&dir, &date);
+    assert!(text.contains("tags: ToDo\n"));
+    assert!(text.contains(&heading));
+
+    // ToDo 一覧にも出る。
+    assert_eq!(app.todos.len(), 1);
+    assert_eq!(app.todos[0].1.group, "現役プロジェクト");
+    assert_eq!(app.todos[0].1.title, "進行中のタスク");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 今日の ToDo が既にあるなら、新しく作らずそれを開く。
+#[test]
+fn t_opens_the_existing_todo() {
+    let (mut app, dir) = seeded_projects("todoexist");
+
+    // 1 回目で作る。
+    app.update(Msg::TodayTodo);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some(request.initial.clone()));
+    assert_eq!(app.todos.len(), 1);
+
+    // 2 回目は既存のエントリを開く。
+    app.update(Msg::TodayTodo);
+    let request = app.take_edit_request().expect("要求が出る");
+    assert!(
+        matches!(request.target, EditTarget::EntryBody { .. }),
+        "新規として開こうとしている: {:?}",
+        request.target
+    );
+    assert!(request.initial.contains("進行中のタスク"));
+
+    // 追記して保存しても、エントリは増えない。
+    app.apply_edit(
+        request.target,
+        Some(format!(
+            "{}\n  - [ ] 手で足したタスク\n",
+            request.initial.trim_end()
+        )),
+    );
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let note = app.notes.iter().find(|n| n.date == today).expect("ある");
+    assert_eq!(note.entries.len(), 1, "エントリが増えている");
+    assert_eq!(app.todos.len(), 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 進行中のタスクが無くても、見出しだけの雛形を出す。
+#[test]
+fn t_works_without_in_progress_tasks() {
+    let (mut app, dir) = seeded_app("todoempty", 1, 30);
+    app.update(Msg::TodayTodo);
+    let request = app.take_edit_request().expect("要求が出る");
+    let heading = crate::model::todo_heading(chrono::Local::now().date_naive());
+    assert_eq!(request.initial, format!("tags: ToDo\n\n# {heading}"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// アーカイブ済みは既定で出さず、A で出る。
 #[test]
 fn archived_projects_are_hidden_by_default() {

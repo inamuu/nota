@@ -95,6 +95,8 @@ pub enum Msg {
     EditEntry,
     /// 今日のノートに新しいエントリを作る。
     NewEntry,
+    /// 今日の ToDo を開く。無ければ進行中のタスクから作る。
+    TodayTodo,
     /// 削除の確認を始める。
     DeleteEntry,
     ConfirmYes,
@@ -304,6 +306,7 @@ impl App {
 
             Msg::EditEntry => self.start_edit_entry(),
             Msg::NewEntry => self.start_new_entry(),
+            Msg::TodayTodo => self.start_today_todo(),
             Msg::DeleteEntry => self.start_delete_entry(),
             Msg::ConfirmYes => self.apply_confirm(),
             Msg::ConfirmNo => {
@@ -511,6 +514,50 @@ impl App {
             self.task_sel = at;
         }
         self.status = Some(format!("{title} → {}", next.label()));
+    }
+
+    /// 今日の ToDo を編集する。まだ無ければ、進行中のタスクを並べた雛形を出す。
+    fn start_today_todo(&mut self) {
+        let today = chrono::Local::now().date_naive();
+        let date = today.format("%Y-%m-%d").to_string();
+
+        // すでに今日の ToDo があるなら、それをそのまま開く。
+        if let Some(note_idx) = self.notes.iter().position(|n| n.date == date) {
+            let note = &self.notes[note_idx];
+            if let Some(entry_idx) = note.entries.iter().position(|e| note.is_todo(e)) {
+                let entry = &note.entries[entry_idx];
+                self.pending_edit = Some(EditRequest {
+                    target: EditTarget::EntryBody {
+                        note_idx,
+                        entry_idx,
+                    },
+                    initial: crate::editor::compose(&entry.tags, &note.body_of(entry).join("\n")),
+                });
+                self.status = Some("今日の ToDo を開きます".into());
+                return;
+            }
+        }
+
+        // 無ければ、アーカイブしていないプロジェクトの進行中タスクを並べる。
+        let groups: Vec<(&str, Vec<&crate::model::ProjectTask>)> = self
+            .projects
+            .iter()
+            .filter(|p| !p.is_archived())
+            .map(|p| (p.name.as_str(), p.tasks_with(TaskStatus::InProgress)))
+            .filter(|(_, tasks)| !tasks.is_empty())
+            .collect();
+        let body = crate::model::build_todo_body(today, &groups);
+        let count: usize = groups.iter().map(|(_, t)| t.len()).sum();
+
+        self.pending_edit = Some(EditRequest {
+            target: EditTarget::NewEntry,
+            initial: crate::editor::compose(&[crate::model::TODO_TAG.to_string()], &body),
+        });
+        self.status = Some(if count > 0 {
+            format!("進行中のタスク {count} 件から作ります")
+        } else {
+            "今日の ToDo を作ります".into()
+        });
     }
 
     fn start_new_entry(&mut self) {
