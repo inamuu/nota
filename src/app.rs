@@ -1036,6 +1036,48 @@ impl App {
         }
         self.rebuild_todos();
         self.status = Some(format!("{} → {}", item.title, next.label()));
+        // ToDo の行がプロジェクトのタスクなら、そちらの状態も合わせる。
+        self.sync_project_from_todo(&item.group, &item.title, next);
+    }
+
+    /// ToDo で変えた状態をプロジェクトのタスクに書き戻す。
+    ///
+    /// 行のグループ名とタイトルで探す。手で足した行のようにプロジェクトに
+    /// 対応が無いものは、そのまま ToDo だけの予定として置いておく。
+    fn sync_project_from_todo(&mut self, group: &str, title: &str, status: TaskStatus) {
+        if group.is_empty() {
+            return;
+        }
+        let Some(project) = self.projects.iter().find(|p| p.name == group) else {
+            return;
+        };
+        // すでに同じ状態なら書かない。更新時刻をむやみに動かさない。
+        if !project
+            .tasks
+            .iter()
+            .any(|t| t.title == title && t.status != status)
+        {
+            return;
+        }
+
+        // 並びは今のまま、対象のタスクだけ状態を変える。
+        let tasks: Vec<(TaskStatus, String)> = project
+            .tasks
+            .iter()
+            .map(|t| {
+                let next = if t.title == title { status } else { t.status };
+                (next, t.title.clone())
+            })
+            .collect();
+
+        let now = chrono::Local::now().timestamp_millis();
+        if let Err(err) = self.store.save_project_tasks(project, &tasks, now) {
+            self.status = Some(format!("プロジェクトに反映できません: {err}"));
+            return;
+        }
+        let name = project.name.clone();
+        self.reload_projects();
+        self.status = Some(format!("{title} → {}（{name} にも反映）", status.label()));
     }
 
     fn reload(&mut self) {

@@ -954,6 +954,119 @@ fn changing_a_task_status_updates_the_todo_view() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// ToDo でチェックを入れると、プロジェクトのタスクにも入る。
+#[test]
+fn checking_a_todo_updates_the_project() {
+    let (mut app, dir) = with_todays_todo("back");
+    app.update(Msg::SwitchView(View::Todo));
+    assert_eq!(app.visible_todos()[0].1.title, "進行中のタスク");
+
+    app.update(Msg::CycleTodo);
+
+    // ToDo 側は完了になる。
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert!(note_text(&dir, &today).contains("- [x] 進行中のタスク"));
+
+    // プロジェクト側にも入る。
+    let json = project_json(&dir, "active");
+    let task = json["tasks"]
+        .as_array()
+        .expect("配列")
+        .iter()
+        .find(|t| t["title"] == "進行中のタスク")
+        .expect("ある");
+    assert_eq!(task["status"], "Done", "プロジェクトに反映されていない");
+    assert!(task["completedAtMs"].as_i64().expect("数値") > 0);
+    assert_eq!(task["id"], "t1", "別のタスクとして作り直されている");
+    // 解釈しない項目も残る。
+    assert_eq!(task["sourceType"], "issue");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 一周させても ToDo とプロジェクトが食い違わない。
+#[test]
+fn cycling_keeps_both_sides_in_step() {
+    let (mut app, dir) = with_todays_todo("roundtrip");
+    app.update(Msg::SwitchView(View::Todo));
+
+    for expected in ["Done", "Backlog", "InProgress"] {
+        app.update(Msg::CycleTodo);
+        let json = project_json(&dir, "active");
+        let task = json["tasks"]
+            .as_array()
+            .expect("配列")
+            .iter()
+            .find(|t| t["title"] == "進行中のタスク")
+            .expect("ある");
+        assert_eq!(task["status"], expected, "ずれている");
+        // ToDo 側の行も同じ状態。
+        assert_eq!(
+            app.visible_todos()[0].1.status.name(),
+            expected,
+            "ToDo 側とプロジェクト側が食い違っている"
+        );
+    }
+
+    // 行は増えていない。反映が往復して重複しない。
+    assert_eq!(app.todos.len(), 1);
+    assert_eq!(
+        project_json(&dir, "active")["tasks"]
+            .as_array()
+            .expect("配列")
+            .len(),
+        5
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// プロジェクトに無い行は ToDo だけの予定として扱う。
+#[test]
+fn a_row_without_a_project_stays_local() {
+    let (mut app, dir) = with_todays_todo("localrow");
+
+    // ToDo に手で 1 行足す。
+    app.update(Msg::SwitchView(View::Todo));
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(
+        request.target,
+        Some(format!(
+            "{}\n  - [ ] 手で足した予定\n",
+            request.initial.trim_end()
+        )),
+    );
+
+    let at = app
+        .visible_todos()
+        .iter()
+        .position(|(_, t)| t.title == "手で足した予定")
+        .expect("ある");
+    for _ in 0..at {
+        app.update(Msg::Move(Move::Down));
+    }
+    app.update(Msg::CycleTodo);
+
+    // プロジェクトのタスクは増えない。
+    let json = project_json(&dir, "active");
+    let titles: Vec<&str> = json["tasks"]
+        .as_array()
+        .expect("配列")
+        .iter()
+        .map(|t| t["title"].as_str().expect("文字列"))
+        .collect();
+    assert!(
+        !titles.contains(&"手で足した予定"),
+        "プロジェクトに混ざっている"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 今日の ToDo がまだ無いときは、勝手にノートを作らない。
 #[test]
 fn syncing_does_nothing_without_a_todo() {
