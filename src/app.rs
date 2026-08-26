@@ -97,6 +97,10 @@ pub enum Msg {
     NewEntry,
     /// 今日の ToDo を開く。無ければ進行中のタスクから作る。
     TodayTodo,
+    /// プロジェクトを新しく作る。
+    NewProject,
+    /// 選択中のプロジェクトを 1 つ下 / 上へ動かす。
+    MoveProject(i32),
     /// 削除の確認を始める。
     DeleteEntry,
     ConfirmYes,
@@ -305,8 +309,22 @@ impl App {
             }
 
             Msg::EditEntry => self.start_edit_entry(),
-            Msg::NewEntry => self.start_new_entry(),
+            Msg::NewEntry => {
+                if self.view == View::Projects {
+                    self.update(Msg::NewProject);
+                } else {
+                    self.start_new_entry();
+                }
+            }
             Msg::TodayTodo => self.start_today_todo(),
+            Msg::MoveProject(delta) => self.move_project(delta),
+            Msg::NewProject => {
+                self.pending_edit = Some(EditRequest {
+                    target: EditTarget::NewProject,
+                    initial: String::new(),
+                });
+                self.status = Some("プロジェクト名を 1 行で書いて保存します".into());
+            }
             Msg::DeleteEntry => self.start_delete_entry(),
             Msg::ConfirmYes => self.apply_confirm(),
             Msg::ConfirmNo => {
@@ -347,6 +365,7 @@ impl App {
                 note_idx,
                 entry_idx,
             } => self.apply_entry_body(note_idx, entry_idx, &text),
+            EditTarget::NewProject => self.create_project(&text),
             EditTarget::ProjectTasks { project_idx } => {
                 self.apply_project_tasks(project_idx, &text)
             }
@@ -435,6 +454,83 @@ impl App {
             },
             initial,
         });
+    }
+
+    /// 一覧の並びを 1 つ入れ替える。
+    ///
+    /// 並び順はデータディレクトリの .nota に持つ。project.json に足すと、
+    /// Acta がそのプロジェクトを保存したときに落ちてしまう。
+    fn move_project(&mut self, delta: i32) {
+        let visible = self.visible_projects();
+        if visible.len() < 2 {
+            return;
+        }
+        let at = self.project_sel;
+        let to = at as i32 + delta;
+        if to < 0 || to as usize >= visible.len() {
+            return;
+        }
+        let to = to as usize;
+
+        // 表示中の並びを基準に入れ替える。隠しているものは今の位置に残す。
+        let mut order: Vec<String> = self.projects.iter().map(|p| p.dir_name.clone()).collect();
+        let from_idx = visible[at];
+        let to_idx = visible[to];
+        let (from_pos, to_pos) = (
+            order
+                .iter()
+                .position(|d| *d == self.projects[from_idx].dir_name),
+            order
+                .iter()
+                .position(|d| *d == self.projects[to_idx].dir_name),
+        );
+        let (Some(from_pos), Some(to_pos)) = (from_pos, to_pos) else {
+            return;
+        };
+        let moved = order.remove(from_pos);
+        order.insert(to_pos, moved);
+
+        if let Err(err) = self.store.save_project_order(&order) {
+            self.status = Some(format!("並びを保存できません: {err}"));
+            return;
+        }
+        self.reload_projects();
+        // reload_projects は選択を名前で追うが、ここでは動かした先に置きたい。
+        self.project_sel = to;
+        self.status = Some(format!(
+            "{} を {} へ",
+            self.selected_project()
+                .map(|p| p.name.as_str())
+                .unwrap_or(""),
+            if delta > 0 { "下" } else { "上" }
+        ));
+    }
+
+    /// 名前を受け取ってプロジェクトを作る。最初の中身のある行だけを見る。
+    fn create_project(&mut self, text: &str) {
+        let Some(name) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+            self.status = Some("名前が空なので作成しませんでした".into());
+            return;
+        };
+        let now = chrono::Local::now().timestamp_millis();
+        match self.store.create_project(name, now) {
+            Ok(dir_name) => {
+                self.reload_projects();
+                // 作ったものを選んだ状態にする。すぐタスクを足せる。
+                self.view = View::Projects;
+                self.focus = Focus::List;
+                if let Some(at) = self
+                    .visible_projects()
+                    .iter()
+                    .position(|i| self.projects[*i].dir_name == dir_name)
+                {
+                    self.project_sel = at;
+                    self.task_sel = 0;
+                }
+                self.status = Some(format!("{name} を作成しました（e でタスクを足せます）"));
+            }
+            Err(err) => self.status = Some(format!("作成に失敗しました: {err}")),
+        }
     }
 
     /// チェックリストの編集結果を project.json に書く。

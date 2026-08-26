@@ -18,6 +18,8 @@ pub enum EditTarget {
     NewEntry,
     /// プロジェクトのタスク一覧をチェックリストとして編集する。
     ProjectTasks { project_idx: usize },
+    /// 新しいプロジェクトの名前を書く。
+    NewProject,
 }
 
 #[derive(Debug, Clone)]

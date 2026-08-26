@@ -523,6 +523,122 @@ fn t_works_without_in_progress_tasks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// プロジェクトビューの o で新しいプロジェクトを作れる。
+#[test]
+fn creating_a_project() {
+    let (mut app, dir) = seeded_projects("create");
+    app.update(Msg::NewEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    assert_eq!(request.target, EditTarget::NewProject);
+    assert!(request.initial.is_empty(), "空から書き始める");
+
+    app.apply_edit(request.target, Some("新しい取り組み Depot\n".to_string()));
+
+    // 作ったものが選ばれた状態になる。
+    let selected = app.selected_project().expect("ある");
+    assert_eq!(selected.name, "新しい取り組み Depot");
+    assert_eq!(selected.dir_name, "depot");
+    assert!(selected.tasks.is_empty());
+    assert!(dir.join("projects/depot/project.json").is_file());
+    assert!(dir.join("projects/depot/knowledge.md").is_file());
+
+    // 続けてタスクを足せる。
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    assert!(request.initial.is_empty(), "タスクは空から");
+    app.apply_edit(request.target, Some("- [-] 最初の作業\n".to_string()));
+    assert_eq!(app.selected_project().expect("ある").tasks.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 名前が空なら作らない。
+#[test]
+fn creating_a_project_needs_a_name() {
+    let (mut app, dir) = seeded_projects("noname");
+    let before = app.projects.len();
+    app.update(Msg::NewEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some("\n   \n".to_string()));
+    assert_eq!(app.projects.len(), before, "作られている");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ノートビューの o は今までどおりエントリを作る。
+#[test]
+fn o_still_creates_an_entry_outside_the_project_view() {
+    let (mut app, dir) = seeded_projects("oentry");
+    app.update(Msg::SwitchView(View::Notes));
+    app.update(Msg::NewEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    assert_eq!(request.target, EditTarget::NewEntry);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// J / K で並びを入れ替えられる。並びは保存されて次回も残る。
+#[test]
+fn reordering_projects() {
+    let (mut app, dir) = seeded_projects("reorder2");
+    app.update(Msg::ToggleArchived);
+    let names = |app: &App| -> Vec<String> {
+        app.visible_projects()
+            .iter()
+            .map(|i| app.projects[*i].name.clone())
+            .collect()
+    };
+    let before = names(&app);
+    assert_eq!(before.len(), 2);
+
+    // 先頭を下へ。
+    app.update(Msg::MoveProject(1));
+    let after = names(&app);
+    assert_eq!(
+        after,
+        vec![before[1].clone(), before[0].clone()],
+        "入れ替わっていない"
+    );
+    // カーソルは動かしたものを追う。
+    assert_eq!(app.selected_project().expect("ある").name, before[0]);
+
+    // 端では動かない。
+    app.update(Msg::MoveProject(1));
+    assert_eq!(names(&app), after);
+
+    // 上に戻す。
+    app.update(Msg::MoveProject(-1));
+    assert_eq!(names(&app), before);
+
+    // 保存されているので、開き直しても同じ並び。
+    app.update(Msg::MoveProject(1));
+    let expected = names(&app);
+    let mut again = App::new(Config {
+        data_dir: dir.clone(),
+        source: "test".into(),
+        recent_notes: 30,
+        project_done_limit: 2,
+    })
+    .expect("起動できる");
+    again.dismiss_splash();
+    again.update(Msg::ToggleArchived);
+    assert_eq!(names(&again), expected, "並びが残っていない");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 新しく作ったプロジェクトも並びの中に入る。
+#[test]
+fn a_new_project_joins_the_order() {
+    let (mut app, dir) = seeded_projects("neworder");
+    app.update(Msg::MoveProject(1));
+    app.update(Msg::NewEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some("later\n".to_string()));
+    // 作った直後に選ばれていて、並びも壊れていない。
+    assert_eq!(app.selected_project().expect("ある").name, "later");
+    assert_eq!(app.visible_projects().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 保存すると updatedAtMs が変わり一覧の並びが変わる。
 /// 選択とタスクの対応が添字ごとずれないことを確かめる。
 #[test]
@@ -988,10 +1104,22 @@ fn help_popup_shows_keys_and_config_source() {
     let out = squash(&render(&mut app, 110, 34));
     assert!(out.contains("キー操作"), "ヘルプの見出しが出ていない");
     // 説明が枠で切れていないこと。以前 $EDITOR の行が途切れていた。
-    assert!(
-        out.contains("エントリを作る（$EDITOR）"),
-        "説明が切れている"
-    );
+    // 一覧の全行について、最後の 1 文字まで出ていることを見る。
+    let squashed = squash(&render(&mut app, 110, 40));
+    for (key, desc) in crate::keys::HELP {
+        let tail: String = desc
+            .chars()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert!(
+            squashed.contains(&squash(&tail)),
+            "{key} の説明が切れている: {desc}"
+        );
+    }
     assert!(out.contains("設定の出どころ"), "設定の出どころが出ていない");
     assert!(
         out.contains("/nonexistent"),

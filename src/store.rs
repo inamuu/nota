@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::model::{initial_note_text, DailyNote, Project, TaskStatus};
 
@@ -12,6 +12,10 @@ const PROJECT_FILE: &str = "project.json";
 const KNOWLEDGE_FILE: &str = "knowledge.md";
 /// Acta の走査除外と揃える。
 const IGNORED_DIRS: [&str; 6] = [".git", "node_modules", "dist", "release", "wiki", "images"];
+/// nota 固有の状態を置く場所。Acta は project.json の未知の項目を書き戻しで
+/// 落とすので、並び順はデータディレクトリの隅に別で持つ。
+const STATE_DIR: &str = ".nota";
+const ORDER_FILE: &str = "project-order.json";
 
 pub struct Store {
     data_dir: PathBuf,
@@ -69,7 +73,16 @@ impl Store {
             project.source_dir = entry.path();
             out.push(project);
         }
-        out.sort_by_key(|p| std::cmp::Reverse(p.updated_at_ms));
+        // 手で並べた順があればそれに従う。載っていないものは更新の新しい順で後ろに置く。
+        let order = self.load_project_order();
+        out.sort_by_key(|p| {
+            let at = order.iter().position(|d| *d == p.dir_name);
+            (
+                at.is_none(),
+                at.unwrap_or(0),
+                std::cmp::Reverse(p.updated_at_ms),
+            )
+        });
         Ok(out)
     }
 
@@ -181,9 +194,94 @@ impl Store {
         Ok(())
     }
 
+    /// 手で並べた順（ディレクトリ名の並び）。無ければ空。
+    pub fn load_project_order(&self) -> Vec<String> {
+        let path = self.data_dir.join(STATE_DIR).join(ORDER_FILE);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        serde_json::from_str(&text).unwrap_or_default()
+    }
+
+    pub fn save_project_order(&self, order: &[String]) -> Result<()> {
+        let dir = self.data_dir.join(STATE_DIR);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("ディレクトリを作れません: {}", dir.display()))?;
+        let text = serde_json::to_string_pretty(order).context("JSON を書き出せません")?;
+        let path = dir.join(ORDER_FILE);
+        std::fs::write(&path, text)
+            .with_context(|| format!("書き込みに失敗しました: {}", path.display()))?;
+        Ok(())
+    }
+
+    /// プロジェクトを新しく作る。作ったディレクトリ名を返す。
+    ///
+    /// Acta の createProject と同じ形で、project.json と空の knowledge.md を置く。
+    pub fn create_project(&self, name: &str, now_ms: i64) -> Result<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("プロジェクト名が空です");
+        }
+        let projects = self.data_dir.join(PROJECTS_DIR);
+        let dir_name = unique_dir_name(&projects, name, now_ms);
+        let dir = projects.join(&dir_name);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("ディレクトリを作れません: {}", dir.display()))?;
+
+        let project = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "name": name,
+            "dirName": dir_name,
+            "createdAtMs": now_ms,
+            "updatedAtMs": now_ms,
+            "archivedAtMs": 0,
+            "issueUrl": "",
+            "tasks": [],
+        });
+        let text = serde_json::to_string_pretty(&project).context("JSON を書き出せません")?;
+        std::fs::write(dir.join(PROJECT_FILE), text)
+            .with_context(|| format!("書き込みに失敗しました: {}", dir.display()))?;
+        // Acta は空でも knowledge.md を置く。揃えておく。
+        std::fs::write(dir.join(KNOWLEDGE_FILE), "")
+            .with_context(|| format!("書き込みに失敗しました: {}", dir.display()))?;
+        Ok(dir_name)
+    }
+
     /// そのファイルが既にあるか。Acta は初日のエントリだけ created を日付のみにする。
     pub fn note_exists(&self, date: &str) -> bool {
         self.note_path(date).map(|p| p.is_file()).unwrap_or(false)
+    }
+}
+
+/// 使われていないディレクトリ名を決める。Acta と同じ規則。
+fn unique_dir_name(projects_dir: &Path, name: &str, now_ms: i64) -> String {
+    let slug = slugify(name, now_ms);
+    let mut candidate = slug.clone();
+    let mut i = 2;
+    while projects_dir.join(&candidate).exists() {
+        candidate = format!("{slug}-{i}");
+        i += 1;
+    }
+    candidate
+}
+
+/// プロジェクト名からディレクトリ名を作る。
+/// 日本語だけの名前は全部落ちるので、そのときは日時から付ける。
+fn slugify(name: &str, now_ms: i64) -> String {
+    let mut out = String::new();
+    for c in name.trim().to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            // 空白も記号もまとめて 1 つのハイフンにする。
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        format!("project-{now_ms}")
+    } else {
+        trimmed
     }
 }
 
@@ -345,6 +443,107 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["2026-01-01.md"]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn applies_the_saved_order() {
+        let dir = temp_dir("order");
+        let store = Store::new(dir.clone());
+        store.create_project("alpha", 1).expect("作れる");
+        store.create_project("beta", 2).expect("作れる");
+        store.create_project("gamma", 3).expect("作れる");
+
+        // 既定は更新の新しい順。
+        let names: Vec<String> = store
+            .load_projects()
+            .expect("読める")
+            .iter()
+            .map(|p| p.dir_name.clone())
+            .collect();
+        assert_eq!(names, vec!["gamma", "beta", "alpha"]);
+
+        // 並びを保存すると従う。
+        store
+            .save_project_order(&["beta".into(), "alpha".into()])
+            .expect("書ける");
+        let names: Vec<String> = store
+            .load_projects()
+            .expect("読める")
+            .iter()
+            .map(|p| p.dir_name.clone())
+            .collect();
+        // 載っていない gamma は後ろに回る。
+        assert_eq!(names, vec!["beta", "alpha", "gamma"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 並び順のファイルが壊れていても落ちない。
+    #[test]
+    fn broken_order_file_is_ignored() {
+        let dir = temp_dir("brokenorder");
+        let store = Store::new(dir.clone());
+        store.create_project("alpha", 1).expect("作れる");
+        let state = dir.join(".nota");
+        std::fs::create_dir_all(&state).expect("作れる");
+        std::fs::write(state.join("project-order.json"), "{ 壊れている").expect("書ける");
+        assert!(store.load_project_order().is_empty());
+        assert_eq!(store.load_projects().expect("読める").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slugifies_like_acta() {
+        assert_eq!(slugify("SRE 対応 Depot", 1), "sre-depot");
+        assert_eq!(slugify("Terraform_Refactor", 1), "terraform_refactor");
+        assert_eq!(slugify("  A  B  ", 1), "a-b");
+        assert_eq!(slugify("a---b", 1), "a-b");
+    }
+
+    /// 日本語だけの名前は英数字が残らないので、日時から付ける。
+    #[test]
+    fn falls_back_for_names_without_ascii() {
+        assert_eq!(slugify("プロジェクト", 1234), "project-1234");
+    }
+
+    #[test]
+    fn avoids_existing_directories() {
+        let dir = temp_dir("slug");
+        std::fs::create_dir_all(dir.join("sre")).expect("作れる");
+        std::fs::create_dir_all(dir.join("sre-2")).expect("作れる");
+        assert_eq!(unique_dir_name(&dir, "SRE", 1), "sre-3");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn creates_a_project() {
+        let dir = temp_dir("create");
+        let store = Store::new(dir.clone());
+        let name = store
+            .create_project("新しい取り組み Depot", 42)
+            .expect("作れる");
+        assert_eq!(name, "depot");
+
+        let projects = store.load_projects().expect("読める");
+        assert_eq!(projects.len(), 1);
+        let project = &projects[0];
+        assert_eq!(project.name, "新しい取り組み Depot");
+        assert_eq!(project.dir_name, "depot");
+        assert_eq!(project.created_at_ms, 42);
+        assert!(!project.is_archived());
+        assert!(project.tasks.is_empty());
+        // knowledge.md も置く。
+        assert!(dir.join("projects/depot/knowledge.md").is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_an_empty_name() {
+        let dir = temp_dir("emptyname");
+        let store = Store::new(dir.clone());
+        assert!(store.create_project("   ", 1).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
