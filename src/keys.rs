@@ -13,7 +13,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("Ctrl-d / Ctrl-u", "半画面ずつ移動"),
     ("g / G", "先頭 / 末尾へ"),
     ("1 / 2 / 3 / 4", "ノート / ToDo / プロジェクト / 検索"),
-    ("Tab / Shift-Tab", "ビューを順に切り替え"),
+    (
+        "Tab / Shift-Tab",
+        "Menu を順に切り替え（検索の入力中も効く）",
+    ),
     ("h / l", "一覧と本文のフォーカスを移動"),
     ("Enter", "ノートは本文へ、検索は該当箇所へジャンプ"),
     ("Space", "ToDo / タスクの状態を進める（未着手→進行中→完了）"),
@@ -63,6 +66,9 @@ fn confirm_mode(key: KeyEvent) -> Option<Msg> {
 fn search_mode(key: KeyEvent, ctrl: bool) -> Option<Msg> {
     match key.code {
         KeyCode::Esc => Some(Msg::SearchCancel),
+        // 入力中も Menu は回せる。文字と衝突しないキーだけ通す。
+        KeyCode::Tab => Some(Msg::NextView),
+        KeyCode::BackTab => Some(Msg::PrevView),
         KeyCode::Enter => Some(Msg::SearchCommit),
         KeyCode::Backspace => Some(Msg::SearchBackspace),
         KeyCode::Char('u') if ctrl => Some(Msg::SearchClear),

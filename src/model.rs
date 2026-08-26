@@ -428,6 +428,107 @@ pub fn build_todo_body(date: chrono::NaiveDate, groups: &[(&str, Vec<&ProjectTas
     lines.join("\n")
 }
 
+/// ToDo 本文にプロジェクトのタスクを流し込む。
+///
+/// Acta の upsertProjectTasksInTodoBody と同じ考え方で、
+/// - 同じタイトルの行があればチェック欄だけ更新する
+/// - 無いものは `append` が立っているときだけ足す
+/// - ToDo 側にしかない行は消さない（手で足した予定を守る）
+///
+/// 戻り値は (新しい本文の行, 足した件数, 状態を変えた件数)。
+pub fn upsert_todo_group(
+    lines: &[String],
+    project_name: &str,
+    tasks: &[(TaskStatus, String, bool)],
+) -> (Vec<String>, usize, usize) {
+    let mut out: Vec<String> = lines.to_vec();
+    let Some(group) = find_todo_group(&out, project_name) else {
+        // グループごと無いので、足すものだけ並べて末尾に置く。
+        let adding: Vec<&(TaskStatus, String, bool)> =
+            tasks.iter().filter(|(_, _, append)| *append).collect();
+        if adding.is_empty() {
+            return (out, 0, 0);
+        }
+        while out.last().is_some_and(|l| l.trim().is_empty()) {
+            out.pop();
+        }
+        out.push(format!("- {project_name}"));
+        for (status, title, _) in &adding {
+            out.push(format!(
+                "{TODO_NESTED_INDENT}- [{}] {title}",
+                status.marker()
+            ));
+        }
+        return (out, adding.len(), 0);
+    };
+
+    // グループ内の既存タスクをタイトルで引けるようにする。
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    for (offset, line) in out[group.start + 1..group.end].iter().enumerate() {
+        if let Some((_, title)) = parse_task_line(line) {
+            if !title.is_empty() && !seen.iter().any(|(t, _)| *t == title) {
+                seen.push((title, group.start + 1 + offset));
+            }
+        }
+    }
+
+    let mut updated = 0;
+    let mut appending = Vec::new();
+    for (status, title, append) in tasks {
+        match seen.iter().find(|(t, _)| t == title) {
+            Some((_, at)) => {
+                if let Some(pos) = marker_position(&out[*at]) {
+                    let mut chars: Vec<char> = out[*at].chars().collect();
+                    if chars[pos] != status.marker() {
+                        chars[pos] = status.marker();
+                        out[*at] = chars.into_iter().collect();
+                        updated += 1;
+                    }
+                }
+            }
+            None if *append => appending.push((*status, title.clone())),
+            None => {}
+        }
+    }
+
+    let added = appending.len();
+    if added > 0 {
+        let rows: Vec<String> = appending
+            .into_iter()
+            .map(|(status, title)| format!("{TODO_NESTED_INDENT}- [{}] {title}", status.marker()))
+            .collect();
+        out.splice(group.end..group.end, rows);
+    }
+    (out, added, updated)
+}
+
+/// `- プロジェクト名` の行と、その配下が続く範囲。
+struct TodoGroup {
+    start: usize,
+    /// 次のグループが始まる位置（この手前までが配下）。
+    end: usize,
+}
+
+fn find_todo_group(lines: &[String], project_name: &str) -> Option<TodoGroup> {
+    let start = lines
+        .iter()
+        .position(|l| parse_group_line(l).as_deref() == Some(project_name))?;
+    let mut end = start + 1;
+    while end < lines.len() {
+        // インデントの無い行が来たら次のグループか別の記述。
+        let line = &lines[end];
+        if !line.trim().is_empty() && !line.starts_with(char::is_whitespace) {
+            break;
+        }
+        end += 1;
+    }
+    // 配下の末尾にある空行は範囲から外す。追記はタスク行の直後に入れたい。
+    while end > start + 1 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    Some(TodoGroup { start, end })
+}
+
 /// 1 日分のファイルの初期内容。Acta が新規作成するときと同じ。
 pub fn initial_note_text(date: &str) -> String {
     format!("# {date}\n\n")
@@ -707,6 +808,116 @@ mod tests {
     fn builds_a_heading_only_body_without_tasks() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 25).expect("日付");
         assert_eq!(build_todo_body(date, &[]), "# ToDo: 2026/08/25（火）");
+    }
+
+    fn to_lines(text: &str) -> Vec<String> {
+        text.split('\n').map(str::to_string).collect()
+    }
+
+    const TODO_BODY: &str = "# ToDo: 2026/08/26（水）\n\
+        - プロジェクト A\n\
+        \x20 - [-] 進行中の作業\n\
+        \x20 - [ ] 手で足した予定\n\
+        - プロジェクト B\n\
+        \x20 - [ ] 別の作業";
+
+    #[test]
+    fn adds_new_tasks_to_an_existing_group() {
+        let (out, added, updated) = upsert_todo_group(
+            &to_lines(TODO_BODY),
+            "プロジェクト A",
+            &[(TaskStatus::InProgress, "新しい作業".into(), true)],
+        );
+        assert_eq!((added, updated), (1, 0));
+        // グループの末尾に入り、次のグループは動かない。
+        assert_eq!(
+            out.join("\n"),
+            "# ToDo: 2026/08/26（水）\n\
+             - プロジェクト A\n\
+             \x20 - [-] 進行中の作業\n\
+             \x20 - [ ] 手で足した予定\n\
+             \x20 - [-] 新しい作業\n\
+             - プロジェクト B\n\
+             \x20 - [ ] 別の作業"
+        );
+    }
+
+    /// 同じタイトルの行はチェック欄だけ変える。二重に足さない。
+    #[test]
+    fn updates_the_marker_of_an_existing_task() {
+        let (out, added, updated) = upsert_todo_group(
+            &to_lines(TODO_BODY),
+            "プロジェクト A",
+            &[(TaskStatus::Done, "進行中の作業".into(), true)],
+        );
+        assert_eq!((added, updated), (0, 1));
+        assert!(out.join("\n").contains("  - [x] 進行中の作業"));
+        assert_eq!(out.len(), to_lines(TODO_BODY).len(), "行が増えている");
+    }
+
+    /// ToDo 側にしか無い行は残す。手で足した予定を消さない。
+    #[test]
+    fn keeps_rows_that_only_exist_in_the_todo() {
+        let (out, _, _) = upsert_todo_group(
+            &to_lines(TODO_BODY),
+            "プロジェクト A",
+            &[(TaskStatus::InProgress, "進行中の作業".into(), true)],
+        );
+        assert!(out.join("\n").contains("- [ ] 手で足した予定"));
+    }
+
+    /// append が false のものは、既存行の更新だけで新しくは足さない。
+    #[test]
+    fn does_not_append_when_not_requested() {
+        let (out, added, _) = upsert_todo_group(
+            &to_lines(TODO_BODY),
+            "プロジェクト A",
+            &[(TaskStatus::Done, "完了した別の作業".into(), false)],
+        );
+        assert_eq!(added, 0);
+        assert!(!out.join("\n").contains("完了した別の作業"));
+    }
+
+    /// グループが無ければ末尾に作る。
+    #[test]
+    fn creates_a_group_when_missing() {
+        let (out, added, _) = upsert_todo_group(
+            &to_lines(TODO_BODY),
+            "新しいプロジェクト",
+            &[(TaskStatus::InProgress, "作業".into(), true)],
+        );
+        assert_eq!(added, 1);
+        assert!(out
+            .join("\n")
+            .ends_with("- 新しいプロジェクト\n  - [-] 作業"));
+    }
+
+    /// 足すものが無ければグループも作らない。
+    #[test]
+    fn creates_nothing_when_there_is_nothing_to_add() {
+        let before = to_lines(TODO_BODY);
+        let (out, added, updated) = upsert_todo_group(
+            &before,
+            "新しいプロジェクト",
+            &[(TaskStatus::Done, "完了".into(), false)],
+        );
+        assert_eq!((added, updated), (0, 0));
+        assert_eq!(out, before);
+    }
+
+    /// 見出しだけの ToDo にも足せる。
+    #[test]
+    fn adds_to_a_heading_only_todo() {
+        let (out, added, _) = upsert_todo_group(
+            &to_lines("# ToDo: 2026/08/26（水）"),
+            "プロジェクト",
+            &[(TaskStatus::InProgress, "作業".into(), true)],
+        );
+        assert_eq!(added, 1);
+        assert_eq!(
+            out.join("\n"),
+            "# ToDo: 2026/08/26（水）\n- プロジェクト\n  - [-] 作業"
+        );
     }
 
     #[test]

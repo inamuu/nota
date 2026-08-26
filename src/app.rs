@@ -453,16 +453,85 @@ impl App {
             self.status = Some(format!("保存に失敗しました: {err}"));
             return;
         }
+        let name = project.name.clone();
         self.reload_projects();
         self.status = Some(format!("タスクを保存しました（{} 件）", tasks.len()));
+        self.sync_today_todo(&name);
+    }
+
+    /// プロジェクトのタスクを今日の ToDo に流し込む。
+    ///
+    /// 今日の ToDo がまだ無いときは何もしない。プロジェクトをいじるたびに
+    /// ノートが勝手に増えるのは驚きが大きいので、作るのは t に任せる。
+    fn sync_today_todo(&mut self, project_name: &str) {
+        // 添字で持ち回らない。保存で updatedAtMs が変わると一覧の並びが変わる。
+        let Some(project) = self.projects.iter().find(|p| p.name == project_name) else {
+            return;
+        };
+        let name = project.name.clone();
+
+        // 進行中は足す。それ以外は、すでに ToDo にある行の状態を合わせるだけ。
+        let tasks: Vec<(TaskStatus, String, bool)> = project
+            .tasks
+            .iter()
+            .map(|t| {
+                (
+                    t.status,
+                    t.title.clone(),
+                    t.status == TaskStatus::InProgress,
+                )
+            })
+            .collect();
+        if tasks.is_empty() {
+            return;
+        }
+
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let Some(note_idx) = self.notes.iter().position(|n| n.date == date) else {
+            return;
+        };
+        let note = &self.notes[note_idx];
+        let Some(entry_idx) = note.entries.iter().position(|e| note.is_todo(e)) else {
+            return;
+        };
+
+        let body: Vec<String> = note
+            .body_of(&note.entries[entry_idx])
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let (next, added, updated) = crate::model::upsert_todo_group(&body, &name, &tasks);
+        if added == 0 && updated == 0 {
+            return;
+        }
+
+        let note = &mut self.notes[note_idx];
+        let before = note.to_text();
+        if !note.replace_entry_body(entry_idx, &next.join("\n")) {
+            return;
+        }
+        let detail = match (added, updated) {
+            (a, 0) => format!("今日の ToDo に {a} 件追加しました"),
+            (0, u) => format!("今日の ToDo の {u} 件を更新しました"),
+            (a, u) => format!("今日の ToDo に {a} 件追加、{u} 件更新しました"),
+        };
+        self.persist(note_idx, before, &detail);
     }
 
     /// プロジェクトだけ読み直す。ノートまで読み直す必要はない。
     fn reload_projects(&mut self) {
+        // 保存で updatedAtMs が変わると並びが変わる。選択は名前で追う。
+        let selected = self.selected_project().map(|p| p.name.clone());
         match self.store.load_projects() {
             Ok(projects) => {
                 self.projects = projects;
-                let len = self.visible_projects().len();
+                let visible = self.visible_projects();
+                if let Some(name) = selected {
+                    if let Some(at) = visible.iter().position(|i| self.projects[*i].name == name) {
+                        self.project_sel = at;
+                    }
+                }
+                let len = visible.len();
                 if self.project_sel >= len {
                     self.project_sel = len.saturating_sub(1);
                 }
@@ -481,6 +550,7 @@ impl App {
             self.status = Some("プロジェクトがありません".into());
             return;
         };
+        let project_name = project.name.clone();
         let project_idx = self.visible_projects()[self.project_sel];
         let visible = self.visible_tasks();
         let Some(target) = visible.get(self.task_sel) else {
@@ -514,6 +584,7 @@ impl App {
             self.task_sel = at;
         }
         self.status = Some(format!("{title} → {}", next.label()));
+        self.sync_today_todo(&project_name);
     }
 
     /// 今日の ToDo を編集する。まだ無ければ、進行中のタスクを並べた雛形を出す。

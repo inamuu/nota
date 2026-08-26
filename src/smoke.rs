@@ -13,6 +13,7 @@ use ratatui::Terminal;
 use crate::app::{App, Confirm, Focus, Mode, Move, Msg, View};
 use crate::config::Config;
 use crate::editor::EditTarget;
+use crate::model::TaskStatus;
 
 fn empty_app() -> App {
     let mut app = App::new(Config {
@@ -310,6 +311,34 @@ fn removing_the_tag_line_clears_tags() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 検索の入力中でも Tab で Menu を回せる。
+#[test]
+fn tab_cycles_menu_while_searching() {
+    let (mut app, dir) = seeded_app("tab", 1, 30);
+    app.update(Msg::SearchStart);
+    assert_eq!(app.view, View::Search);
+    assert_eq!(app.mode, Mode::Search);
+
+    // 検索の次はノートに回り、入力モードも抜ける。
+    app.update(Msg::NextView);
+    assert_eq!(app.view, View::Notes);
+    assert_eq!(app.mode, Mode::Normal, "入力モードが残っている");
+
+    // 一周して戻る。
+    for _ in 0..3 {
+        app.update(Msg::NextView);
+    }
+    assert_eq!(app.view, View::Search);
+    assert_eq!(app.mode, Mode::Search, "検索に戻ったら入力できる");
+
+    // 逆回しも同じ。
+    app.update(Msg::PrevView);
+    assert_eq!(app.view, View::Projects);
+    assert_eq!(app.mode, Mode::Normal);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 検索は Esc 一発で抜けて、開く前のビューに戻る。
 #[test]
 fn escape_leaves_search_for_the_previous_view() {
@@ -491,6 +520,167 @@ fn t_works_without_in_progress_tasks() {
     let request = app.take_edit_request().expect("要求が出る");
     let heading = crate::model::todo_heading(chrono::Local::now().date_naive());
     assert_eq!(request.initial, format!("tags: ToDo\n\n# {heading}"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 保存すると updatedAtMs が変わり一覧の並びが変わる。
+/// 選択とタスクの対応が添字ごとずれないことを確かめる。
+#[test]
+fn saving_keeps_the_selected_project() {
+    let (mut app, dir) = seeded_projects("reorder");
+    app.update(Msg::ToggleArchived);
+    // 更新が古い順に並ぶので、2 件目を選んでから保存する。
+    app.update(Msg::Move(Move::Down));
+    let picked = app.selected_project().expect("ある").name.clone();
+
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(
+        request.target,
+        Some(format!("{}- [-] 足した作業\n", request.initial)),
+    );
+
+    let after = app.selected_project().expect("ある");
+    assert_eq!(after.name, picked, "選択が別のプロジェクトに移っている");
+    assert!(
+        after.tasks.iter().any(|t| t.title == "足した作業"),
+        "別のプロジェクトに書かれている"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// t で今日の ToDo を用意してから、プロジェクト側の操作を反映させる。
+fn with_todays_todo(tag: &str) -> (App, PathBuf) {
+    let (mut app, dir) = seeded_projects(tag);
+    app.update(Msg::TodayTodo);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some(request.initial.clone()));
+    app.update(Msg::SwitchView(View::Projects));
+    (app, dir)
+}
+
+/// プロジェクトにタスクを足すと、今日の ToDo にも出る。
+#[test]
+fn adding_a_project_task_reaches_the_todo_view() {
+    let (mut app, dir) = with_todays_todo("sync");
+    // 雛形の時点では進行中の 1 件だけ。
+    assert_eq!(app.todos.len(), 1);
+
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(
+        request.target,
+        Some(format!("{}- [-] 追加した作業\n", request.initial)),
+    );
+
+    // ToDo ビューに増えている。
+    assert_eq!(app.todos.len(), 2, "ToDo に反映されていない");
+    let titles: Vec<&str> = app.todos.iter().map(|(_, t)| t.title.as_str()).collect();
+    assert!(titles.contains(&"追加した作業"));
+    assert_eq!(app.todos[1].1.group, "現役プロジェクト");
+
+    // ファイルにも入っている。
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let text = note_text(&dir, &today);
+    assert!(
+        text.contains("  - [-] 追加した作業\n"),
+        "書けていない: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 未着手のタスクを足しただけでは ToDo に出さない。着手していない予定で埋めない。
+#[test]
+fn backlog_tasks_do_not_reach_the_todo_view() {
+    let (mut app, dir) = with_todays_todo("backlog");
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(
+        request.target,
+        Some(format!("{}- [ ] まだ着手しない\n", request.initial)),
+    );
+    assert_eq!(app.todos.len(), 1, "未着手まで入っている");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// プロジェクト側で状態を変えると、今日の ToDo のチェック欄も追従する。
+#[test]
+fn changing_a_task_status_updates_the_todo_view() {
+    let (mut app, dir) = with_todays_todo("status");
+    assert_eq!(app.todos[0].1.status, TaskStatus::InProgress);
+
+    app.update(Msg::ToggleFocus);
+    app.update(Msg::CycleTodo);
+
+    // InProgress → Done が ToDo 側にも入る。
+    app.update(Msg::SwitchView(View::Todo));
+    assert_eq!(app.todos.len(), 1, "行が増えている");
+    assert_eq!(app.todos[0].1.status, TaskStatus::Done, "追従していない");
+
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert!(note_text(&dir, &today).contains("  - [x] 進行中のタスク\n"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 今日の ToDo がまだ無いときは、勝手にノートを作らない。
+#[test]
+fn syncing_does_nothing_without_a_todo() {
+    let (mut app, dir) = seeded_projects("nosync");
+    let before = app.notes.len();
+
+    app.update(Msg::ToggleFocus);
+    app.update(Msg::CycleTodo);
+
+    assert_eq!(app.notes.len(), before, "ノートが増えている");
+    assert!(app.todos.is_empty());
+    // プロジェクト側の変更自体は保存されている。
+    let json = project_json(&dir, "active");
+    let task = json["tasks"]
+        .as_array()
+        .expect("配列")
+        .iter()
+        .find(|t| t["title"] == "進行中のタスク")
+        .expect("ある");
+    assert_eq!(task["status"], "Done");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ToDo 側で手を入れた行は、反映で消さない。
+#[test]
+fn syncing_keeps_rows_added_by_hand() {
+    let (mut app, dir) = with_todays_todo("byhand");
+
+    // ToDo に手で 1 行足す。
+    app.update(Msg::SwitchView(View::Todo));
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(
+        request.target,
+        Some(format!(
+            "{}\n  - [ ] 手で足した予定\n",
+            request.initial.trim_end()
+        )),
+    );
+    assert_eq!(app.todos.len(), 2);
+
+    // プロジェクト側をいじっても残る。
+    app.update(Msg::SwitchView(View::Projects));
+    app.update(Msg::ToggleFocus);
+    app.update(Msg::CycleTodo);
+
+    let titles: Vec<&str> = app.todos.iter().map(|(_, t)| t.title.as_str()).collect();
+    assert!(titles.contains(&"手で足した予定"), "消えている: {titles:?}");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
