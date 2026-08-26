@@ -6,11 +6,28 @@ rust = "latest"
 # NOTA_DATA_DIR = "{{env.HOME}}/Documents/Acta"
 
 [tasks.build]
-description = "デバッグビルド"
+description = "リリースビルドして /usr/local/bin に配置"
+# /usr/local/bin は root 所有のことが多い。書けるならそのまま、
+# 書けなければ sudo に切り替える。install は権限も同時に設定する。
+run = """
+set -e
+cargo build --release
+dest=/usr/local/bin/nota
+if [ -w /usr/local/bin ]; then
+  install -m 755 target/release/nota "$dest"
+else
+  echo "$dest へ配置するため sudo を使います"
+  sudo install -m 755 target/release/nota "$dest"
+fi
+echo "配置しました: $dest ($("$dest" --version))"
+"""
+
+[tasks.check]
+description = "デバッグビルド（コンパイル確認）"
 run = "cargo build"
 
 [tasks.release]
-description = "リリースビルド"
+description = "リリースビルドのみ（配置しない）"
 run = "cargo build --release"
 
 [tasks.run]

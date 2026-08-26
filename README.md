@@ -148,11 +148,14 @@ Rust ツールチェーンは [mise](https://mise.jdx.dev/) で管理してい�
 
 ```sh
 mise install
-mise run build          # cargo build
-mise run release        # cargo build --release
+mise run build          # リリースビルドして /usr/local/bin に配置
 ```
 
-バイナリは `target/release/nota`。
+`mise run build` はリリースビルドしたバイナリを `/usr/local/bin/nota` に上書きする。
+`/usr/local/bin` が root 所有なら sudo に切り替わるので、パスワードを聞かれる。
+
+配置せずビルドだけしたいときは `mise run release`（`target/release/nota` に出る）、
+コンパイルが通るかだけ見たいときは `mise run check`。
 
 ## 設定
 
