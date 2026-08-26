@@ -355,6 +355,11 @@ fn draw_projects(app: &mut App, frame: &mut Frame, area: Rect) {
     if hidden > 0 {
         title.push_str(&format!("（完了 他 {hidden} 件）"));
     }
+    title.push_str(if focused {
+        "  Space で状態を進める"
+    } else {
+        "  l で選ぶ"
+    });
     if items.is_empty() {
         items.push(ListItem::new(Span::styled(
             "タスクがありません",
@@ -367,7 +372,8 @@ fn draw_projects(app: &mut App, frame: &mut Frame, area: Rect) {
         .highlight_style(cursor_style(focused))
         .highlight_symbol(CURSOR);
     let mut state = ListState::default();
-    if focused && !visible_tasks.is_empty() {
+    if !visible_tasks.is_empty() {
+        // フォーカスが無くても選択行は出す。Space がどれに効くかを見せるため。
         state.select(Some(app.task_sel));
     }
     frame.render_stateful_widget(list, cols[1], &mut state);

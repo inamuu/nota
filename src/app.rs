@@ -456,6 +456,11 @@ impl App {
             note.set_entry_tags(entry_idx, &tags);
         }
         self.persist(note_idx, before, "保存しました");
+        // エディタでチェックを書き換えた分もプロジェクトへ送る。
+        let changed = self.sync_projects_from_note(note_idx);
+        if changed > 0 {
+            self.status = Some(format!("保存しました（プロジェクト {changed} 件にも反映）"));
+        }
     }
 
     /// 保存に失敗したら画面の状態も元に戻す。ファイルと表示を食い違わせない。
@@ -709,6 +714,17 @@ impl App {
 
     /// プロジェクトのタスクの状態を 1 段進める。
     fn cycle_project_task(&mut self) {
+        // 左ペインにいるときは、どのタスクが対象か画面から読み取れない。
+        // 一番上を黙って変えてしまわないよう、まずタスク側へ移る。
+        if self.focus == Focus::List {
+            if self.visible_tasks().is_empty() {
+                self.status = Some("タスクがありません".into());
+                return;
+            }
+            self.focus = Focus::Detail;
+            self.status = Some("タスクを選んで Space で状態を進めます".into());
+            return;
+        }
         let Some(project) = self.selected_project() else {
             self.status = Some("プロジェクトがありません".into());
             return;
@@ -1037,47 +1053,88 @@ impl App {
         self.rebuild_todos();
         self.status = Some(format!("{} → {}", item.title, next.label()));
         // ToDo の行がプロジェクトのタスクなら、そちらの状態も合わせる。
-        self.sync_project_from_todo(&item.group, &item.title, next);
+        if self.sync_projects_from_rows(&[(item.group.clone(), item.title.clone(), next)]) > 0 {
+            self.status = Some(format!(
+                "{} → {}（{} にも反映）",
+                item.title,
+                next.label(),
+                item.group
+            ));
+        }
     }
 
-    /// ToDo で変えた状態をプロジェクトのタスクに書き戻す。
+    /// ToDo の行の状態をプロジェクトのタスクに書き戻す。
     ///
-    /// 行のグループ名とタイトルで探す。手で足した行のようにプロジェクトに
+    /// 行のグループ名とタスク名で探す。手で足した行のようにプロジェクトに
     /// 対応が無いものは、そのまま ToDo だけの予定として置いておく。
-    fn sync_project_from_todo(&mut self, group: &str, title: &str, status: TaskStatus) {
-        if group.is_empty() {
-            return;
+    /// 戻り値は書き換えたプロジェクトの数。
+    fn sync_projects_from_rows(&mut self, rows: &[(String, String, TaskStatus)]) -> usize {
+        // プロジェクトごとにまとめてから書く。1 行ずつ保存すると、
+        // 同じファイルを何度も開くうえに更新時刻も無駄に動く。
+        let mut groups: Vec<String> = Vec::new();
+        for (group, _, _) in rows {
+            if !group.is_empty() && !groups.contains(group) {
+                groups.push(group.clone());
+            }
         }
-        let Some(project) = self.projects.iter().find(|p| p.name == group) else {
-            return;
+
+        let mut changed = 0;
+        for group in groups {
+            let Some(project) = self.projects.iter().find(|p| p.name == group) else {
+                continue;
+            };
+            // その行が指すタスクだけ状態を差し替える。並びは今のまま。
+            let tasks: Vec<(TaskStatus, String)> = project
+                .tasks
+                .iter()
+                .map(|t| {
+                    let next = rows
+                        .iter()
+                        .find(|(g, title, _)| *g == group && *title == t.title)
+                        .map(|(_, _, status)| *status)
+                        .unwrap_or(t.status);
+                    (next, t.title.clone())
+                })
+                .collect();
+            // すでに同じ状態なら書かない。更新時刻をむやみに動かさない。
+            if tasks
+                .iter()
+                .zip(project.tasks.iter())
+                .all(|((next, _), t)| *next == t.status)
+            {
+                continue;
+            }
+
+            let now = chrono::Local::now().timestamp_millis();
+            if let Err(err) = self.store.save_project_tasks(project, &tasks, now) {
+                self.status = Some(format!("プロジェクトに反映できません: {err}"));
+                continue;
+            }
+            changed += 1;
+        }
+
+        if changed > 0 {
+            self.reload_projects();
+        }
+        changed
+    }
+
+    /// ノートの中の ToDo 行をまとめてプロジェクトへ反映する。
+    /// エディタで直接チェックを書き換えたときに使う。
+    fn sync_projects_from_note(&mut self, note_idx: usize) -> usize {
+        let Some(note) = self.notes.get(note_idx) else {
+            return 0;
         };
-        // すでに同じ状態なら書かない。更新時刻をむやみに動かさない。
-        if !project
-            .tasks
-            .iter()
-            .any(|t| t.title == title && t.status != status)
-        {
-            return;
-        }
-
-        // 並びは今のまま、対象のタスクだけ状態を変える。
-        let tasks: Vec<(TaskStatus, String)> = project
-            .tasks
-            .iter()
-            .map(|t| {
-                let next = if t.title == title { status } else { t.status };
-                (next, t.title.clone())
-            })
+        let rows: Vec<(String, String, TaskStatus)> = note
+            .todo_items()
+            .into_iter()
+            .filter(|item| !item.group.is_empty())
+            .map(|item| (item.group, item.title, item.status))
             .collect();
-
-        let now = chrono::Local::now().timestamp_millis();
-        if let Err(err) = self.store.save_project_tasks(project, &tasks, now) {
-            self.status = Some(format!("プロジェクトに反映できません: {err}"));
-            return;
+        if rows.is_empty() {
+            return 0;
         }
-        let name = project.name.clone();
-        self.reload_projects();
-        self.status = Some(format!("{title} → {}（{name} にも反映）", status.label()));
+        self.sync_projects_from_rows(&rows)
     }
 
     fn reload(&mut self) {

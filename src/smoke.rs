@@ -987,6 +987,127 @@ fn checking_a_todo_updates_the_project() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// エディタでチェックを書き換えた分もプロジェクトに入る。
+#[test]
+fn editing_checkboxes_in_the_editor_reaches_the_project() {
+    let (mut app, dir) = with_todays_todo("manual");
+    app.update(Msg::SwitchView(View::Todo));
+
+    // ToDo をエディタで開き、チェック欄を直接書き換える。
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    assert!(request.initial.contains("- [-] 進行中のタスク"));
+    app.apply_edit(
+        request.target,
+        Some(
+            request
+                .initial
+                .replace("- [-] 進行中のタスク", "- [x] 進行中のタスク"),
+        ),
+    );
+
+    let json = project_json(&dir, "active");
+    let task = json["tasks"]
+        .as_array()
+        .expect("配列")
+        .iter()
+        .find(|t| t["title"] == "進行中のタスク")
+        .expect("ある");
+    assert_eq!(task["status"], "Done", "プロジェクトに反映されていない");
+    assert_eq!(task["id"], "t1", "作り直されている");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 複数行をまとめて書き換えても、全部反映する。
+#[test]
+fn editing_many_checkboxes_at_once() {
+    let (mut app, dir) = seeded_projects("many");
+
+    // 2 件を進行中にしてから今日の ToDo を作る。
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(
+        request.target,
+        Some("- [-] 進行中のタスク\n- [-] 未着手のタスク\n".to_string()),
+    );
+    app.update(Msg::TodayTodo);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some(request.initial.clone()));
+
+    // ToDo 側で 2 行とも完了にする。
+    app.update(Msg::SwitchView(View::Todo));
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(
+        request.target,
+        Some(request.initial.replace("- [-]", "- [x]")),
+    );
+
+    let json = project_json(&dir, "active");
+    for title in ["進行中のタスク", "未着手のタスク"] {
+        let task = json["tasks"]
+            .as_array()
+            .expect("配列")
+            .iter()
+            .find(|t| t["title"] == title)
+            .expect("ある");
+        assert_eq!(task["status"], "Done", "{title} が反映されていない");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 左ペインにいる間の Space は、一番上を変えずにタスク側へ移るだけ。
+#[test]
+fn space_moves_focus_before_changing_a_task() {
+    let (mut app, dir) = seeded_projects("focus");
+    assert_eq!(app.focus, Focus::List);
+    let before = project_json(&dir, "active");
+
+    app.update(Msg::CycleTodo);
+    assert_eq!(app.focus, Focus::Detail, "タスク側へ移っていない");
+    assert_eq!(
+        project_json(&dir, "active"),
+        before,
+        "一番上を勝手に変えている"
+    );
+
+    // 2 件目を選んでから押すと、その行が変わる。
+    app.update(Msg::Move(Move::Down));
+    let target = app.visible_tasks()[app.task_sel].title.clone();
+    assert_eq!(target, "未着手のタスク");
+    app.update(Msg::CycleTodo);
+
+    let json = project_json(&dir, "active");
+    let tasks = json["tasks"].as_array().expect("配列");
+    let changed = tasks.iter().find(|t| t["title"] == target).expect("ある");
+    assert_eq!(changed["status"], "InProgress");
+    // 一番上は元のまま。
+    let top = tasks
+        .iter()
+        .find(|t| t["title"] == "進行中のタスク")
+        .expect("ある");
+    assert_eq!(top["status"], "InProgress", "別の行が変わっている");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// どのタスクが対象かは、フォーカスが無くても画面から分かる。
+#[test]
+fn the_task_cursor_is_always_visible() {
+    let (mut app, dir) = seeded_projects("cursor");
+    let out = render(&mut app, 100, 20);
+    assert!(out.contains("▌"), "選択行の印が出ていない");
+    assert!(squash(&out).contains("lで選ぶ"), "操作の案内が出ていない");
+
+    app.update(Msg::ToggleFocus);
+    let out = squash(&render(&mut app, 100, 20));
+    assert!(out.contains("Spaceで状態を進める"), "案内が変わっていない");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 一周させても ToDo とプロジェクトが食い違わない。
 #[test]
 fn cycling_keeps_both_sides_in_step() {
