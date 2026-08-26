@@ -434,9 +434,15 @@ impl App {
                 self.status = Some("プロジェクトがありません".into());
                 return;
             };
+            let checklist = self.projects[project_idx].tasks_as_checklist();
             self.pending_edit = Some(EditRequest {
                 target: EditTarget::ProjectTasks { project_idx },
-                initial: self.projects[project_idx].tasks_as_checklist(),
+                // タスクが 1 件も無いと何を書けばよいか分からないので、行の形を出す。
+                initial: if checklist.is_empty() {
+                    "- [ ] ".to_string()
+                } else {
+                    checklist
+                },
             });
             return;
         }
@@ -542,6 +548,10 @@ impl App {
         // 全部消して保存されたときは、事故を疑って何もしない。
         if tasks.is_empty() && !project.tasks.is_empty() {
             self.status = Some("タスクが空になったので変更しませんでした".into());
+            return;
+        }
+        if tasks.is_empty() {
+            self.status = Some("タスクとして読み取れる行がありませんでした".into());
             return;
         }
         let now = chrono::Local::now().timestamp_millis();

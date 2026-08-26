@@ -178,11 +178,29 @@ impl Project {
     }
 }
 
-/// チェックリストを (状態, タイトル) の並びに戻す。解釈できない行は捨てる。
+/// チェックリストを (状態, タイトル) の並びに戻す。
+///
+/// `- [ ] タイトル` を基本とするが、記法を知らずに名前だけ並べても拾えるよう、
+/// 箇条書きの印もチェック欄も無い行は未着手のタスクとして扱う。
+/// 見出しと空行だけは読み飛ばす。
 pub fn parse_checklist(text: &str) -> Vec<(TaskStatus, String)> {
     text.lines()
-        .filter_map(parse_task_line)
-        .filter(|(_, title)| !title.is_empty())
+        .filter_map(|line| {
+            if let Some((status, title)) = parse_task_line(line) {
+                return (!title.is_empty()).then_some((status, title));
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+            // 箇条書きの印だけ付いている行も拾う。
+            let title = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+                .unwrap_or(trimmed)
+                .trim();
+            (!title.is_empty()).then(|| (TaskStatus::Backlog, title.to_string()))
+        })
         .collect()
 }
 
@@ -771,6 +789,32 @@ mod tests {
         assert_eq!(TaskStatus::Backlog.next(), TaskStatus::InProgress);
         assert_eq!(TaskStatus::InProgress.next(), TaskStatus::Done);
         assert_eq!(TaskStatus::Done.next(), TaskStatus::Backlog);
+    }
+
+    #[test]
+    fn parses_a_checklist() {
+        let tasks = parse_checklist("- [-] 進行中\n- [ ] 未着手\n- [x] 完了\n");
+        assert_eq!(
+            tasks,
+            vec![
+                (TaskStatus::InProgress, "進行中".to_string()),
+                (TaskStatus::Backlog, "未着手".to_string()),
+                (TaskStatus::Done, "完了".to_string()),
+            ]
+        );
+    }
+
+    /// 記法を知らずに名前だけ並べても、未着手のタスクとして拾う。
+    #[test]
+    fn parses_plain_lines_as_tasks() {
+        let tasks = parse_checklist("最初の作業\n- 次の作業\n\n# 見出しは飛ばす\n");
+        assert_eq!(
+            tasks,
+            vec![
+                (TaskStatus::Backlog, "最初の作業".to_string()),
+                (TaskStatus::Backlog, "次の作業".to_string()),
+            ]
+        );
     }
 
     #[test]

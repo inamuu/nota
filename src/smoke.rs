@@ -545,9 +545,74 @@ fn creating_a_project() {
     // 続けてタスクを足せる。
     app.update(Msg::EditEntry);
     let request = app.take_edit_request().expect("要求が出る");
-    assert!(request.initial.is_empty(), "タスクは空から");
+    // タスクが無いときは行の形を出す。空白のままだとどう書くか分からない。
+    assert_eq!(request.initial, "- [ ] ", "雛形が出ていない");
     app.apply_edit(request.target, Some("- [-] 最初の作業\n".to_string()));
     assert_eq!(app.selected_project().expect("ある").tasks.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 新規プロジェクトで、チェックボックス無しに書いても反映されるか。
+#[test]
+fn plain_lines_become_tasks() {
+    let (mut app, dir) = seeded_projects("plain");
+    app.update(Msg::NewEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some("新規\n".to_string()));
+
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    // 箇条書きの記法を知らずに、名前だけ並べて保存した場合。
+    app.apply_edit(request.target, Some("最初の作業\n次の作業\n".to_string()));
+
+    let tasks = &app.selected_project().expect("ある").tasks;
+    assert_eq!(tasks.len(), 2, "タスクにならなかった");
+    assert_eq!(tasks[0].title, "最初の作業");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 雛形のまま何も書かずに閉じたときは、そう伝えて何もしない。
+#[test]
+fn saving_the_bare_template_reports_nothing_read() {
+    let (mut app, dir) = seeded_projects("template");
+    app.update(Msg::NewEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some("新規\n".to_string()));
+
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(request.target, Some("- [ ] \n".to_string()));
+
+    assert!(app.selected_project().expect("ある").tasks.is_empty());
+    let status = app.status.clone().expect("知らせがある");
+    assert!(
+        status.contains("読み取れる行がありません"),
+        "黙って終わっている: {status}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 既存プロジェクトでも、記法を混ぜて書ける。
+#[test]
+fn mixed_notation_is_accepted() {
+    let (mut app, dir) = seeded_projects("mixed");
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    app.apply_edit(
+        request.target,
+        Some("- [-] 進行中のタスク\n記法なしで足す\n- 印だけ付けて足す\n".to_string()),
+    );
+
+    let tasks = &app.selected_project().expect("ある").tasks;
+    let titles: Vec<&str> = tasks.iter().map(|t| t.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        vec!["進行中のタスク", "記法なしで足す", "印だけ付けて足す"]
+    );
+    assert_eq!(tasks[1].status, TaskStatus::Backlog);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
