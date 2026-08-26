@@ -27,6 +27,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("/", "全文検索。Esc で元のビューに戻る"),
     ("a", "ノート一覧を直近だけ / 全件で切り替え"),
     ("A", "アーカイブ済みプロジェクトの表示を切り替え"),
+    ("s", "ToDo の並び順を変える（日付 / 状態 / プロジェクト）"),
+    ("f", "ToDo を未完だけにするか切り替え"),
     ("J / K", "プロジェクトの並びを下 / 上へ入れ替え"),
     ("r", "データを再読み込み"),
     ("?", "このヘルプ"),
@@ -45,6 +47,11 @@ pub fn handle(app: &App, key: KeyEvent) -> Option<Msg> {
     match app.mode {
         Mode::Help => match key.code {
             KeyCode::Char('q') => Some(Msg::Quit),
+            // 低い端末では入りきらないので、送れるようにしておく。
+            KeyCode::Char('j') | KeyCode::Down => Some(Msg::Move(Move::Down)),
+            KeyCode::Char('k') | KeyCode::Up => Some(Msg::Move(Move::Up)),
+            KeyCode::Char('d') if ctrl => Some(Msg::Move(Move::PageDown)),
+            KeyCode::Char('u') if ctrl => Some(Msg::Move(Move::PageUp)),
             _ => Some(Msg::ToggleHelp),
         },
         Mode::Search => search_mode(key, ctrl),
@@ -88,6 +95,8 @@ fn normal_mode(app: &App, key: KeyEvent, ctrl: bool) -> Option<Msg> {
         KeyCode::Char('r') => Some(Msg::Reload),
         KeyCode::Char('a') => Some(Msg::ToggleAllNotes),
         KeyCode::Char('A') => Some(Msg::ToggleArchived),
+        KeyCode::Char('s') => Some(Msg::CycleTodoSort),
+        KeyCode::Char('f') => Some(Msg::ToggleTodoFilter),
         KeyCode::Char('J') if app.view == View::Projects => Some(Msg::MoveProject(1)),
         KeyCode::Char('K') if app.view == View::Projects => Some(Msg::MoveProject(-1)),
         KeyCode::Char('1') => Some(Msg::SwitchView(View::Notes)),

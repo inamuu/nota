@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use crate::app::{App, Confirm, Focus, Mode, Move, Msg, View};
+use crate::app::{App, Confirm, Focus, Mode, Move, Msg, TodoSort, View};
 use crate::config::Config;
 use crate::editor::EditTarget;
 use crate::model::TaskStatus;
@@ -97,6 +97,148 @@ fn note_list_starts_narrowed_and_expands() {
     app.update(Msg::ToggleAllNotes);
     assert_eq!(app.visible_notes(), 2);
     assert_eq!(app.note_sel, 1, "選択が範囲外に残っている");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 状態の違う ToDo を持つ一時データ。
+fn seeded_todos(tag: &str) -> (App, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("nota-todos-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // 日付が新しいほうが先に出る。中身は状態を散らしておく。
+    let days = [
+        (1, "Beta", "[x] 完了した作業"),
+        (2, "Alpha", "[-] 進行中の作業"),
+        (3, "Beta", "[ ] 未着手の作業"),
+    ];
+    for (day, group, task) in days {
+        let post = dir.join(format!("posts/2026/01/{day:02}"));
+        std::fs::create_dir_all(&post).expect("作れる");
+        let date = format!("2026-01-{day:02}");
+        let body = format!(
+            "# {date}\n\n<!-- acta:comment\nid: id-{day}\ncreated: {date} 09:00\ncreated_ms: {day}\ntags: ToDo\n-->\n# ToDo: {date}\n- {group}\n  - {task}\n<!-- /acta:comment -->\n\n"
+        );
+        std::fs::write(post.join(format!("{date}.md")), body).expect("書ける");
+    }
+    let mut app = App::new(Config {
+        data_dir: dir.clone(),
+        source: "test".into(),
+        recent_notes: 30,
+        project_done_limit: 5,
+    })
+    .expect("起動できる");
+    app.dismiss_splash();
+    app.update(Msg::SwitchView(View::Todo));
+    (app, dir)
+}
+
+fn todo_titles(app: &App) -> Vec<String> {
+    app.visible_todos()
+        .iter()
+        .map(|(_, item)| item.title.clone())
+        .collect()
+}
+
+/// 既定は日付の新しい順。
+#[test]
+fn todos_are_sorted_by_date_first() {
+    let (app, dir) = seeded_todos("date");
+    assert_eq!(app.todo_sort, TodoSort::Date);
+    assert_eq!(
+        todo_titles(&app),
+        vec!["未着手の作業", "進行中の作業", "完了した作業"]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// f で未完だけに絞れる。
+#[test]
+fn f_shows_only_open_todos() {
+    let (mut app, dir) = seeded_todos("open");
+    app.update(Msg::ToggleTodoFilter);
+    assert!(app.todo_open_only);
+    assert_eq!(todo_titles(&app), vec!["未着手の作業", "進行中の作業"]);
+
+    // 見出しにも出す。
+    let out = squash(&render(&mut app, 100, 20));
+    assert!(out.contains("未完のみ"), "表示が出ていない: {out}");
+
+    // もう一度押すと戻る。
+    app.update(Msg::ToggleTodoFilter);
+    assert_eq!(todo_titles(&app).len(), 3);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// s で並び順が巡回する。
+#[test]
+fn s_cycles_the_sort_order() {
+    let (mut app, dir) = seeded_todos("sort");
+
+    app.update(Msg::CycleTodoSort);
+    assert_eq!(app.todo_sort, TodoSort::Status);
+    assert_eq!(
+        todo_titles(&app),
+        vec!["未着手の作業", "進行中の作業", "完了した作業"]
+    );
+
+    app.update(Msg::CycleTodoSort);
+    assert_eq!(app.todo_sort, TodoSort::Project);
+    // プロジェクト名順。同じ名前の中では日付の新しい順が残る。
+    assert_eq!(
+        todo_titles(&app),
+        vec!["進行中の作業", "未着手の作業", "完了した作業"]
+    );
+
+    app.update(Msg::CycleTodoSort);
+    assert_eq!(app.todo_sort, TodoSort::Date);
+
+    let out = squash(&render(&mut app, 100, 20));
+    assert!(out.contains("日付順"), "並び順が出ていない: {out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 並びを変えても、選んでいた行を追いかける。
+#[test]
+fn changing_the_order_keeps_the_selection() {
+    let (mut app, dir) = seeded_todos("keep");
+    // 3 番目（完了した作業）を選ぶ。
+    app.update(Msg::Move(Move::Bottom));
+    assert_eq!(app.visible_todos()[app.todo_sel].1.title, "完了した作業");
+
+    app.update(Msg::CycleTodoSort);
+    assert_eq!(
+        app.visible_todos()[app.todo_sel].1.title,
+        "完了した作業",
+        "別の行に移っている"
+    );
+
+    // 絞り込みで消える行を選んでいたら、先頭に戻す。
+    app.update(Msg::ToggleTodoFilter);
+    assert_eq!(app.visible_todos().len(), 2);
+    assert!(app.todo_sel < 2, "範囲外を指している");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 絞り込み中でも Space は正しい行に効く。
+#[test]
+fn space_hits_the_right_row_while_filtered() {
+    let (mut app, dir) = seeded_todos("filtered");
+    app.update(Msg::ToggleTodoFilter);
+    // 未完のうち 2 番目（進行中の作業）。
+    app.update(Msg::Move(Move::Down));
+    assert_eq!(app.visible_todos()[app.todo_sel].1.title, "進行中の作業");
+
+    app.update(Msg::CycleTodo);
+
+    // 進行中 → 完了になり、絞り込みから外れる。
+    let text = note_text(&dir, "2026-01-02");
+    assert!(
+        text.contains("- [x] 進行中の作業"),
+        "別の行を変えている: {text}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1067,6 +1209,54 @@ fn entry_separator_fills_the_pane() {
         "区切りが伸びていない: {separator}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 低い端末ではヘルプが入りきらないので、送って読めるようにする。
+#[test]
+fn help_scrolls_on_a_short_terminal() {
+    let mut app = empty_app();
+    app.update(Msg::ToggleHelp);
+
+    // 全部は入らない高さで開く。
+    let first = squash(&render(&mut app, 110, 16));
+    assert!(first.contains("キー操作"), "見出しが無い");
+    assert!(first.contains("キー操作1/"), "位置が出ていない");
+    let last = crate::keys::HELP.last().expect("項目がある").1;
+    assert!(!first.contains(&squash(last)), "全部入ってしまっている");
+
+    // 送ると後ろが見える。
+    for _ in 0..30 {
+        app.update(Msg::Move(Move::Down));
+    }
+    let scrolled = squash(&render(&mut app, 110, 16));
+    assert!(
+        scrolled.contains(&squash(last)),
+        "送っても出てこない: {scrolled}"
+    );
+
+    // 高い端末なら位置は出ない。
+    app.update(Msg::ToggleHelp);
+    app.update(Msg::ToggleHelp);
+    let tall = squash(&render(&mut app, 110, 40));
+    assert!(
+        !tall.contains("キー操作1/"),
+        "収まっているのに位置が出ている"
+    );
+}
+
+/// ヘルプは移動以外のキーで閉じる。
+#[test]
+fn help_closes_on_other_keys() {
+    let mut app = empty_app();
+    app.update(Msg::ToggleHelp);
+    assert_eq!(app.mode, Mode::Help);
+    // 送っても閉じない。
+    app.update(Msg::Move(Move::Down));
+    assert_eq!(app.mode, Mode::Help);
+    // 閉じたらスクロール位置は戻る。
+    app.update(Msg::ToggleHelp);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.help_scroll, 0);
 }
 
 /// 起動直後はロゴが出て、キーを押すと通常の画面になる。

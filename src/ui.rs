@@ -225,8 +225,8 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
 fn draw_todo(app: &mut App, frame: &mut Frame, area: Rect) {
     app.viewport = area.height.saturating_sub(2).max(1) as usize;
 
-    let items: Vec<ListItem> = app
-        .todos
+    let todos = app.visible_todos();
+    let items: Vec<ListItem> = todos
         .iter()
         .map(|(_, item)| {
             let (mark, color) = match item.status {
@@ -254,13 +254,16 @@ fn draw_todo(app: &mut App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    let title = format!("ToDo  {} 件  Space で状態を進める", app.todos.len());
+    let mut title = format!("ToDo {} 件  {}", todos.len(), app.todo_sort.label());
+    if app.todo_open_only {
+        title.push_str("  未完のみ");
+    }
     let list = List::new(items)
         .block(bordered(&title, true))
         .highlight_style(cursor_style(true))
         .highlight_symbol(CURSOR);
     let mut state = ListState::default();
-    if !app.todos.is_empty() {
+    if !todos.is_empty() {
         state.select(Some(app.todo_sel));
     }
     frame.render_stateful_widget(list, area, &mut state);
@@ -487,9 +490,21 @@ fn draw_help(app: &App, frame: &mut Frame, area: Rect) {
         Style::default().fg(DIM),
     )));
 
+    // 端末が低いと全部は入らない。j / k で送れるようにしておく。
+    let inner = popup.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner);
+    let scroll = app.help_scroll.min(max_scroll);
+    let title = if max_scroll > 0 {
+        format!("キー操作  {}/{}", scroll + 1, max_scroll + 1)
+    } else {
+        "キー操作".to_string()
+    };
+
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(bordered("キー操作", true)),
+        Paragraph::new(lines)
+            .block(bordered(&title, true))
+            .scroll((scroll as u16, 0)),
         popup,
     );
 }

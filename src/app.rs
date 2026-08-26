@@ -59,6 +59,35 @@ impl Confirm {
     }
 }
 
+/// ToDo 一覧の並び順。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoSort {
+    /// 新しい日付から。既定。
+    Date,
+    /// 未着手・進行中・完了の順。
+    Status,
+    /// プロジェクト名の順。
+    Project,
+}
+
+impl TodoSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Date => "日付順",
+            Self::Status => "状態順",
+            Self::Project => "プロジェクト順",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Date => Self::Status,
+            Self::Status => Self::Project,
+            Self::Project => Self::Date,
+        }
+    }
+}
+
 /// ビュー内のフォーカス。左の一覧か、右の本文か。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -91,6 +120,10 @@ pub enum Msg {
     ToggleAllNotes,
     /// アーカイブ済みのプロジェクトを出すかどうか。
     ToggleArchived,
+    /// ToDo 一覧の並び順を変える。
+    CycleTodoSort,
+    /// ToDo 一覧を未完だけにするかどうか。
+    ToggleTodoFilter,
     /// 選択中のエントリを $EDITOR で編集する。
     EditEntry,
     /// 今日のノートに新しいエントリを作る。
@@ -183,6 +216,12 @@ pub struct App {
     pub show_all_notes: bool,
     /// アーカイブ済みのプロジェクトを出しているか。既定は隠す。
     pub show_archived: bool,
+    /// ToDo 一覧の並び順。
+    pub todo_sort: TodoSort,
+    /// ToDo 一覧を未完だけにしているか。
+    pub todo_open_only: bool,
+    /// ヘルプ画面のスクロール位置。低い端末でも全部読めるようにする。
+    pub help_scroll: usize,
     pub should_quit: bool,
     /// 直近の描画で本文ペインに収まった行数。ページ移動の幅に使う。
     pub viewport: usize,
@@ -220,6 +259,9 @@ impl App {
             status: None,
             show_all_notes: false,
             show_archived: false,
+            todo_sort: TodoSort::Date,
+            todo_open_only: false,
+            help_scroll: 0,
             should_quit: false,
             viewport: 20,
         };
@@ -241,6 +283,7 @@ impl App {
                 } else {
                     Mode::Help
                 };
+                self.help_scroll = 0;
             }
             Msg::SwitchView(view) => self.switch_view(view),
             Msg::NextView => self.cycle_view(1),
@@ -260,6 +303,20 @@ impl App {
                 }
             }
             Msg::Reload => self.reload(),
+            Msg::CycleTodoSort => {
+                self.todo_sort = self.todo_sort.next();
+                self.keep_todo_selection();
+                self.status = Some(format!("ToDo を{}に並べます", self.todo_sort.label()));
+            }
+            Msg::ToggleTodoFilter => {
+                self.todo_open_only = !self.todo_open_only;
+                self.keep_todo_selection();
+                self.status = Some(if self.todo_open_only {
+                    format!("未完の {} 件だけ表示", self.visible_todos().len())
+                } else {
+                    format!("すべての {} 件を表示", self.visible_todos().len())
+                });
+            }
             Msg::ToggleArchived => {
                 self.show_archived = !self.show_archived;
                 let len = self.visible_projects().len();
@@ -854,7 +911,7 @@ impl App {
                 Some((self.note_sel, entry_idx))
             }
             View::Todo => {
-                let (note_idx, item) = self.todos.get(self.todo_sel)?;
+                let (note_idx, item) = self.visible_todos().get(self.todo_sel).copied()?;
                 let note = self.notes.get(*note_idx)?;
                 let entry_idx = note
                     .entries
@@ -910,6 +967,11 @@ impl App {
     }
 
     fn apply_move(&mut self, m: Move) {
+        if self.mode == Mode::Help {
+            // 行数は描画側が知っているので、ここでは上限を決めず送るだけにする。
+            self.help_scroll = shift(self.help_scroll, m, usize::MAX - 1, 5);
+            return;
+        }
         // 本文ペインにフォーカスがあるときはスクロール。それ以外は一覧のカーソル。
         if self.view == View::Notes && self.focus == Focus::Detail {
             let max = self.detail_lines().len().saturating_sub(1);
@@ -928,9 +990,10 @@ impl App {
         }
         let visible = self.visible_notes();
         let visible_projects = self.visible_projects().len();
+        let visible_todos = self.visible_todos().len();
         let (sel, len) = match self.view {
             View::Notes => (&mut self.note_sel, visible),
-            View::Todo => (&mut self.todo_sel, self.todos.len()),
+            View::Todo => (&mut self.todo_sel, visible_todos),
             View::Projects => (&mut self.project_sel, visible_projects),
             View::Search => (&mut self.search_sel, self.hits.len()),
         };
@@ -949,7 +1012,11 @@ impl App {
     }
 
     fn cycle_todo(&mut self) {
-        let Some((note_idx, item)) = self.todos.get(self.todo_sel).cloned() else {
+        let Some((note_idx, item)) = self
+            .visible_todos()
+            .get(self.todo_sel)
+            .map(|x| (*x).clone())
+        else {
             self.status = Some("ToDo がありません".into());
             return;
         };
@@ -990,10 +1057,48 @@ impl App {
     fn clamp_all(&mut self) {
         let visible = self.visible_notes();
         clamp(&mut self.note_sel, visible);
-        clamp(&mut self.todo_sel, self.todos.len());
+        let visible = self.visible_todos().len();
+        clamp(&mut self.todo_sel, visible);
         clamp(&mut self.project_sel, self.projects.len());
         clamp(&mut self.search_sel, self.hits.len());
         self.detail_scroll = 0;
+    }
+
+    /// 画面に出す ToDo。並び順と絞り込みを適用した結果。
+    pub fn visible_todos(&self) -> Vec<&(usize, TodoItem)> {
+        let mut out: Vec<&(usize, TodoItem)> = self
+            .todos
+            .iter()
+            .filter(|(_, item)| !self.todo_open_only || item.status != TaskStatus::Done)
+            .collect();
+        // todos は日付の新しい順に積んであるので、Date はそのまま。
+        // 他の並びも安定ソートなので、同じ値の中では日付順が残る。
+        match self.todo_sort {
+            TodoSort::Date => {}
+            TodoSort::Status => out.sort_by_key(|(_, item)| match item.status {
+                TaskStatus::Backlog => 0,
+                TaskStatus::InProgress => 1,
+                TaskStatus::Done => 2,
+            }),
+            TodoSort::Project => out.sort_by(|(_, a), (_, b)| a.group.cmp(&b.group)),
+        }
+        out
+    }
+
+    /// 並びや絞り込みを変えても、選んでいた行を見失わないようにする。
+    fn keep_todo_selection(&mut self) {
+        let current = self
+            .visible_todos()
+            .get(self.todo_sel)
+            .map(|(_, item)| (item.date.clone(), item.line));
+        let next = self.visible_todos();
+        self.todo_sel = current
+            .and_then(|(date, line)| {
+                next.iter()
+                    .position(|(_, i)| i.date == date && i.line == line)
+            })
+            .unwrap_or(0)
+            .min(next.len().saturating_sub(1));
     }
 
     pub fn rebuild_todos(&mut self) {
@@ -1004,7 +1109,8 @@ impl App {
             }
         }
         self.todos = out;
-        clamp(&mut self.todo_sel, self.todos.len());
+        let visible = self.visible_todos().len();
+        clamp(&mut self.todo_sel, visible);
     }
 
     fn run_search(&mut self) {
