@@ -148,6 +148,15 @@ pub enum Msg {
     DismissStatus,
 }
 
+/// ToDo ビューの右ペインに並べる行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TodoRow {
+    /// プロジェクト名の見出し。選択の対象にはしない。
+    Group(String),
+    /// `visible_todos()` の何番目か。
+    Task(usize),
+}
+
 /// 本文ペインの 1 行。描画とスクロール位置の計算で共用する。
 #[derive(Debug, Clone)]
 pub struct DetailLine {
@@ -155,6 +164,8 @@ pub struct DetailLine {
     pub kind: LineKind,
     /// この行が属するエントリ。ヘッダ行も含む。
     pub entry_idx: usize,
+    /// ToDo のタスク行なら、ファイル内の行番号。本文で選んで進めるのに使う。
+    pub task_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +204,11 @@ pub struct App {
 
     pub note_sel: usize,
     pub detail_scroll: usize,
+    /// 本文ペインで選んでいる ToDo タスクの通し番号。
+    pub note_task_sel: usize,
+    /// ToDo ビューの左ペイン（日付）のカーソル。
+    pub todo_date_sel: usize,
+    /// ToDo ビューの右ペイン（タスク）のカーソル。
     pub todo_sel: usize,
     pub project_sel: usize,
     /// プロジェクトのタスク一覧のカーソル。
@@ -247,6 +263,8 @@ impl App {
             focus: Focus::List,
             note_sel: 0,
             detail_scroll: 0,
+            note_task_sel: 0,
+            todo_date_sel: 0,
             todo_sel: 0,
             project_sel: 0,
             task_sel: 0,
@@ -988,10 +1006,17 @@ impl App {
             self.help_scroll = shift(self.help_scroll, m, usize::MAX - 1, 5);
             return;
         }
-        // 本文ペインにフォーカスがあるときはスクロール。それ以外は一覧のカーソル。
+        // 本文ペインにフォーカスがあるとき。ToDo のタスクがあればその行を選び、
+        // 無ければ今までどおりスクロールする。
         if self.view == View::Notes && self.focus == Focus::Detail {
-            let max = self.detail_lines().len().saturating_sub(1);
-            self.detail_scroll = shift(self.detail_scroll, m, max, self.viewport);
+            let tasks = self.note_task_positions();
+            if tasks.is_empty() {
+                let max = self.detail_lines().len().saturating_sub(1);
+                self.detail_scroll = shift(self.detail_scroll, m, max, self.viewport);
+                return;
+            }
+            self.note_task_sel = shift(self.note_task_sel, m, tasks.len() - 1, self.viewport);
+            self.scroll_to_note_task();
             return;
         }
         // プロジェクトビューで本文側にいるときはタスクを選ぶ。
@@ -1004,12 +1029,22 @@ impl App {
             self.task_sel = shift(self.task_sel, m, len - 1, self.viewport);
             return;
         }
+        // ToDo ビューも同じ形。右にいるときはその日のタスクを選ぶ。
+        if self.view == View::Todo && self.focus == Focus::Detail {
+            let len = self.visible_todos().len();
+            if len == 0 {
+                self.todo_sel = 0;
+                return;
+            }
+            self.todo_sel = shift(self.todo_sel, m, len - 1, self.viewport);
+            return;
+        }
         let visible = self.visible_notes();
         let visible_projects = self.visible_projects().len();
-        let visible_todos = self.visible_todos().len();
+        let visible_dates = self.visible_todo_dates().len();
         let (sel, len) = match self.view {
             View::Notes => (&mut self.note_sel, visible),
-            View::Todo => (&mut self.todo_sel, visible_todos),
+            View::Todo => (&mut self.todo_date_sel, visible_dates),
             View::Projects => (&mut self.project_sel, visible_projects),
             View::Search => (&mut self.search_sel, self.hits.len()),
         };
@@ -1025,9 +1060,29 @@ impl App {
         if self.view == View::Projects {
             self.task_sel = 0;
         }
+        // 日を移ったらタスクのカーソルは先頭に戻す。
+        if self.view == View::Todo {
+            self.todo_sel = 0;
+        }
     }
 
     fn cycle_todo(&mut self) {
+        // ノートビューでは、本文に出ているタスク行をそのまま進める。
+        if self.view == View::Notes {
+            self.cycle_note_task();
+            return;
+        }
+        // 日付側にいるときは、どのタスクが対象か画面から読み取れない。
+        // プロジェクトビューと同じく、まずタスク側へ移る。
+        if self.view == View::Todo && self.focus == Focus::List {
+            if self.visible_todos().is_empty() {
+                self.status = Some("ToDo がありません".into());
+                return;
+            }
+            self.focus = Focus::Detail;
+            self.status = Some("タスクを選んで Space で状態を進めます".into());
+            return;
+        }
         let Some((note_idx, item)) = self
             .visible_todos()
             .get(self.todo_sel)
@@ -1163,15 +1218,59 @@ impl App {
         self.detail_scroll = 0;
     }
 
-    /// 画面に出す ToDo。並び順と絞り込みを適用した結果。
-    pub fn visible_todos(&self) -> Vec<&(usize, TodoItem)> {
-        let mut out: Vec<&(usize, TodoItem)> = self
-            .todos
+    /// 絞り込みを通ったあとの ToDo。日付一覧もタスク一覧もここから作る。
+    fn filtered_todos(&self) -> Vec<&(usize, TodoItem)> {
+        self.todos
             .iter()
             .filter(|(_, item)| !self.todo_open_only || item.status != TaskStatus::Done)
+            .collect()
+    }
+
+    /// 左ペインに出す日付。新しい順で、既定は直近だけ。
+    ///
+    /// 古い ToDo まで並べても探しにくいので、ノート一覧と同じ考え方で絞る。
+    /// `a` を押すと全部出る。
+    pub fn visible_todo_dates(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (_, item) in self.filtered_todos() {
+            if !out.contains(&item.date) {
+                out.push(item.date.clone());
+            }
+        }
+        if !self.show_all_notes && self.config.recent_notes > 0 {
+            out.truncate(self.config.recent_notes);
+        }
+        out
+    }
+
+    /// 絞らなければ何日ぶんあるか。見出しに「30/58」と出すために使う。
+    pub fn todo_dates_total(&self) -> usize {
+        let mut out: Vec<&str> = Vec::new();
+        for (_, item) in self.filtered_todos() {
+            if !out.contains(&item.date.as_str()) {
+                out.push(&item.date);
+            }
+        }
+        out.len()
+    }
+
+    /// いま選んでいる日付。
+    pub fn selected_todo_date(&self) -> Option<String> {
+        self.visible_todo_dates().get(self.todo_date_sel).cloned()
+    }
+
+    /// 右ペインに出す ToDo。選んだ日のぶんだけを、指定の並びで返す。
+    pub fn visible_todos(&self) -> Vec<&(usize, TodoItem)> {
+        let Some(date) = self.selected_todo_date() else {
+            return Vec::new();
+        };
+        let mut out: Vec<&(usize, TodoItem)> = self
+            .filtered_todos()
+            .into_iter()
+            .filter(|(_, item)| item.date == date)
             .collect();
-        // todos は日付の新しい順に積んであるので、Date はそのまま。
-        // 他の並びも安定ソートなので、同じ値の中では日付順が残る。
+        // ファイルに書かれた順がそのまま入っている。並べ替えは安定ソートなので、
+        // 同じ値の中では元の順が残る。
         match self.todo_sort {
             TodoSort::Date => {}
             TodoSort::Status => out.sort_by_key(|(_, item)| match item.status {
@@ -1184,12 +1283,34 @@ impl App {
         out
     }
 
+    /// 右ペインの行。プロジェクト名の見出しを挟んで階層に見せる。
+    pub fn todo_rows(&self) -> Vec<TodoRow> {
+        let mut out = Vec::new();
+        let mut current: Option<String> = None;
+        for (at, (_, item)) in self.visible_todos().iter().enumerate() {
+            // 見出しは並びの中でグループが切り替わったところに出す。
+            if current.as_deref() != Some(item.group.as_str()) {
+                if !item.group.is_empty() {
+                    out.push(TodoRow::Group(item.group.clone()));
+                }
+                current = Some(item.group.clone());
+            }
+            out.push(TodoRow::Task(at));
+        }
+        out
+    }
+
     /// 並びや絞り込みを変えても、選んでいた行を見失わないようにする。
     fn keep_todo_selection(&mut self) {
         let current = self
             .visible_todos()
             .get(self.todo_sel)
             .map(|(_, item)| (item.date.clone(), item.line));
+        // 日付の並びも変わりうるので、まず日付側を収める。
+        let dates = self.visible_todo_dates();
+        if self.todo_date_sel >= dates.len() {
+            self.todo_date_sel = dates.len().saturating_sub(1);
+        }
         let next = self.visible_todos();
         self.todo_sel = current
             .and_then(|(date, line)| {
@@ -1279,6 +1400,9 @@ impl App {
         let Some(note) = self.notes.get(note_idx) else {
             return Vec::new();
         };
+        // ToDo のタスク行はファイル行番号で覚えておき、本文からも進められるようにする。
+        let task_lines: Vec<usize> = note.todo_items().iter().map(|i| i.line).collect();
+
         let mut out = Vec::new();
         for (entry_idx, entry) in note.entries.iter().enumerate() {
             let tags = if entry.tags.is_empty() {
@@ -1291,9 +1415,11 @@ impl App {
                 text: format!("── {}{}", short_time(&entry.created), tags),
                 kind: LineKind::Header,
                 entry_idx,
+                task_line: None,
             });
             let mut in_code = false;
-            for line in note.body_of(entry) {
+            for (offset, line) in note.body_of(entry).into_iter().enumerate() {
+                let file_line = entry.body.start + offset;
                 let trimmed = line.trim_start();
                 if trimmed.starts_with("```") {
                     in_code = !in_code;
@@ -1301,6 +1427,7 @@ impl App {
                         text: line.to_string(),
                         kind: LineKind::Code,
                         entry_idx,
+                        task_line: None,
                     });
                     continue;
                 }
@@ -1319,15 +1446,104 @@ impl App {
                     text: line.to_string(),
                     kind,
                     entry_idx,
+                    // コードブロックの中の似た行は対象外。todo_items が拾った行だけ。
+                    task_line: (!in_code && task_lines.contains(&file_line)).then_some(file_line),
                 });
             }
             out.push(DetailLine {
                 text: String::new(),
                 kind: LineKind::Body,
                 entry_idx,
+                task_line: None,
             });
         }
         out
+    }
+
+    /// ノートの本文で選んでいるタスクの状態を進める。
+    ///
+    /// ToDo ビューと同じく、書き戻したあとプロジェクトへも送る。
+    fn cycle_note_task(&mut self) {
+        if self.focus == Focus::List {
+            if self.note_task_positions().is_empty() {
+                self.status = Some("この日に ToDo はありません".into());
+                return;
+            }
+            self.focus = Focus::Detail;
+            self.status = Some("タスクを選んで Space で状態を進めます".into());
+            return;
+        }
+        let Some(line) = self.selected_note_task() else {
+            self.status = Some("この日に ToDo はありません".into());
+            return;
+        };
+        let note_idx = self.note_sel;
+        // 行から今の状態とタイトルを引く。書き戻しの相手を探すのに使う。
+        let Some(item) = self.notes[note_idx]
+            .todo_items()
+            .into_iter()
+            .find(|i| i.line == line)
+        else {
+            return;
+        };
+        let next = item.status.next();
+
+        let before = self.notes[note_idx].to_text();
+        if !self.notes[note_idx].set_task_status(line, next) {
+            self.status = Some("チェック欄が見つかりません".into());
+            return;
+        }
+        if let Err(err) = self.store.save_note(&self.notes[note_idx]) {
+            let path = self.notes[note_idx].path.clone();
+            let date = self.notes[note_idx].date.clone();
+            self.notes[note_idx] = DailyNote::parse(date, path, &before);
+            self.status = Some(format!("保存に失敗しました: {err}"));
+            return;
+        }
+        self.rebuild_todos();
+        self.status = Some(format!("{} → {}", item.title, next.label()));
+        if self.sync_projects_from_rows(&[(item.group.clone(), item.title.clone(), next)]) > 0 {
+            self.status = Some(format!(
+                "{} → {}（{} にも反映）",
+                item.title,
+                next.label(),
+                item.group
+            ));
+        }
+    }
+
+    /// 選んでいるタスク行が画面に入るようスクロールを合わせる。
+    fn scroll_to_note_task(&mut self) {
+        let tasks = self.note_task_positions();
+        let Some(at) = tasks.get(self.note_task_sel).copied() else {
+            return;
+        };
+        let height = self.viewport.max(1);
+        if at < self.detail_scroll {
+            self.detail_scroll = at;
+        } else if at >= self.detail_scroll + height {
+            self.detail_scroll = at + 1 - height;
+        }
+    }
+
+    /// 本文で選んでいるタスク行のファイル行番号。
+    pub fn selected_note_task(&self) -> Option<usize> {
+        let lines = self.detail_lines();
+        let at = self
+            .note_task_positions()
+            .get(self.note_task_sel)
+            .copied()?;
+        lines.get(at)?.task_line
+    }
+
+    /// 本文ペインの中で、選べるタスク行が何行目にあるか。
+    pub fn note_task_positions(&self) -> Vec<usize> {
+        self.detail_lines()
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.task_line.is_some())
+            .map(|(at, _)| at)
+            .collect()
     }
 
     pub fn selected_project(&self) -> Option<&Project> {

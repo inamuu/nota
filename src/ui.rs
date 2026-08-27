@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Focus, LineKind, Mode, View};
+use crate::app::{App, Focus, LineKind, Mode, TodoRow, View};
 use crate::keys::HELP;
 use crate::model::TaskStatus;
 
@@ -193,25 +193,52 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
     let inner_height = cols[1].height.saturating_sub(2) as usize;
     app.viewport = inner_height.max(1);
 
-    let title = app
+    let on_detail = app.focus == Focus::Detail;
+    let tasks = app.note_task_positions();
+    let mut title = app
         .selected_note()
         .map(|n| n.date.clone())
         .unwrap_or_else(|| "ノートがありません".into());
+    if !tasks.is_empty() {
+        title.push_str(if on_detail {
+            "  Space で状態を進める"
+        } else {
+            "  l で ToDo を選ぶ"
+        });
+    }
+    // いま選んでいるタスク行。本文からも状態を進められる。
+    let cursor = tasks.get(app.note_task_sel).copied();
+
     // エントリの区切りはペイン幅まで伸ばす。境界がひと目で分かる。
     let inner_width = cols[1].width.saturating_sub(2) as usize;
     let lines: Vec<Line> = app
         .detail_lines()
         .into_iter()
-        .map(|l| {
-            let span = Span::styled(l.text, style_for(l.kind));
-            if l.kind != LineKind::Header {
-                return Line::from(span);
+        .enumerate()
+        .map(|(at, l)| {
+            if l.kind == LineKind::Header {
+                let span = Span::styled(l.text, style_for(l.kind));
+                let rest = inner_width.saturating_sub(span.width() + 1);
+                return Line::from(vec![
+                    span,
+                    Span::styled(format!(" {}", "─".repeat(rest)), Style::default().fg(DIM)),
+                ]);
             }
-            let rest = inner_width.saturating_sub(span.width() + 1);
-            Line::from(vec![
-                span,
-                Span::styled(format!(" {}", "─".repeat(rest)), Style::default().fg(DIM)),
-            ])
+            // タスク行は選択中だけ印を付ける。行頭が動かないよう幅は揃える。
+            if l.task_line.is_some() {
+                let selected = cursor == Some(at);
+                let mark = if selected { CURSOR } else { "  " };
+                let style = if selected {
+                    cursor_style(on_detail)
+                } else {
+                    style_for(l.kind)
+                };
+                return Line::from(vec![
+                    Span::styled(mark, Style::default().fg(ACCENT)),
+                    Span::styled(l.text, style),
+                ]);
+            }
+            Line::from(Span::styled(l.text, style_for(l.kind)))
         })
         .collect();
     let total = lines.len();
@@ -223,50 +250,105 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_todo(app: &mut App, frame: &mut Frame, area: Rect) {
-    app.viewport = area.height.saturating_sub(2).max(1) as usize;
+    // ノートビューと同じ 2 ペイン。左で日を選び、右でその日のタスクを選ぶ。
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(18), Constraint::Min(20)])
+        .split(area);
+    app.viewport = cols[0].height.saturating_sub(2).max(1) as usize;
 
-    let todos = app.visible_todos();
-    let items: Vec<ListItem> = todos
+    let dates = app.visible_todo_dates();
+    let on_dates = app.focus == Focus::List;
+    let items: Vec<ListItem> = dates
         .iter()
-        .map(|(_, item)| {
-            let (mark, color) = match item.status {
-                TaskStatus::Backlog => ("[ ]", Color::Reset),
-                TaskStatus::InProgress => ("[-]", PROGRESS),
-                TaskStatus::Done => ("[x]", DONE),
-            };
-            let mut spans = vec![
-                Span::styled(format!("{} ", item.date), Style::default().fg(DIM)),
-                Span::styled(format!("{mark} "), Style::default().fg(color)),
-            ];
-            if !item.group.is_empty() {
-                spans.push(Span::styled(
-                    format!("{} / ", item.group),
-                    Style::default().fg(ACCENT),
-                ));
-            }
-            let title_style = if item.status == TaskStatus::Done {
-                Style::default().fg(DIM).add_modifier(Modifier::CROSSED_OUT)
-            } else {
-                Style::default()
-            };
-            spans.push(Span::styled(item.title.clone(), title_style));
-            ListItem::new(Line::from(spans))
+        .map(|date| {
+            let open = app
+                .todos
+                .iter()
+                .filter(|(_, i)| i.date == *date && i.status != TaskStatus::Done)
+                .count();
+            ListItem::new(Line::from(vec![
+                Span::raw(date.clone()),
+                Span::styled(
+                    format!("  {open}"),
+                    Style::default().fg(if open > 0 { PROGRESS } else { DIM }),
+                ),
+            ]))
         })
         .collect();
 
-    let mut title = format!("ToDo {} 件  {}", todos.len(), app.todo_sort.label());
+    let all_dates = app.todo_dates_total();
+    let title = if dates.len() < all_dates {
+        format!("日付 {}/{}", dates.len(), all_dates)
+    } else {
+        "日付".to_string()
+    };
+    let list = List::new(items)
+        .block(bordered(&title, on_dates))
+        .highlight_style(cursor_style(on_dates))
+        .highlight_symbol(CURSOR);
+    let mut state = ListState::default();
+    if !dates.is_empty() {
+        state.select(Some(app.todo_date_sel));
+    }
+    frame.render_stateful_widget(list, cols[0], &mut state);
+
+    // 右ペイン。プロジェクト名の見出しを挟んで階層に見せる。
+    let todos = app.visible_todos();
+    let rows = app.todo_rows();
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| match row {
+            TodoRow::Group(name) => ListItem::new(Line::from(Span::styled(
+                name.clone(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ))),
+            TodoRow::Task(at) => {
+                let item = &todos[*at].1;
+                let (mark, color) = match item.status {
+                    TaskStatus::Backlog => ("[ ]", Color::Reset),
+                    TaskStatus::InProgress => ("[-]", PROGRESS),
+                    TaskStatus::Done => ("[x]", DONE),
+                };
+                let title_style = if item.status == TaskStatus::Done {
+                    Style::default().fg(DIM).add_modifier(Modifier::CROSSED_OUT)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("  {mark} "), Style::default().fg(color)),
+                    Span::styled(item.title.clone(), title_style),
+                ]))
+            }
+        })
+        .collect();
+
+    let mut title = app
+        .selected_todo_date()
+        .unwrap_or_else(|| "ToDo がありません".into());
+    title.push_str(&format!("  {}", app.todo_sort.label()));
     if app.todo_open_only {
         title.push_str("  未完のみ");
     }
+    title.push_str(if on_dates {
+        "  l で選ぶ"
+    } else {
+        "  Space で状態を進める"
+    });
+
     let list = List::new(items)
-        .block(bordered(&title, true))
-        .highlight_style(cursor_style(true))
+        .block(bordered(&title, !on_dates))
+        .highlight_style(cursor_style(!on_dates))
         .highlight_symbol(CURSOR);
     let mut state = ListState::default();
-    if !todos.is_empty() {
-        state.select(Some(app.todo_sel));
+    // 見出しを挟むぶん、選択中のタスクが何行目かを引き直す。
+    if let Some(at) = rows
+        .iter()
+        .position(|r| matches!(r, TodoRow::Task(i) if *i == app.todo_sel))
+    {
+        state.select(Some(at));
     }
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, cols[1], &mut state);
 }
 
 fn draw_projects(app: &mut App, frame: &mut Frame, area: Rect) {

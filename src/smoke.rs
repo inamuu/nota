@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use crate::app::{App, Confirm, Focus, Mode, Move, Msg, TodoSort, View};
+use crate::app::{App, Confirm, Focus, Mode, Move, Msg, TodoRow, TodoSort, View};
 use crate::config::Config;
 use crate::editor::EditTarget;
 use crate::model::TaskStatus;
@@ -105,18 +105,21 @@ fn note_list_starts_narrowed_and_expands() {
 fn seeded_todos(tag: &str) -> (App, PathBuf) {
     let dir = std::env::temp_dir().join(format!("nota-todos-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    // 日付が新しいほうが先に出る。中身は状態を散らしておく。
+    // 日付が新しいほうが先に出る。1 日の中にグループと状態を散らしておく。
     let days = [
-        (1, "Beta", "[x] 完了した作業"),
-        (2, "Alpha", "[-] 進行中の作業"),
-        (3, "Beta", "[ ] 未着手の作業"),
+        (1, "- Beta\n  - [x] 完了した作業\n"),
+        (2, "- Alpha\n  - [-] 進行中の作業\n"),
+        (
+            3,
+            "- Alpha\n  - [ ] 未着手の作業\n- Beta\n  - [-] 進行中の別作業\n  - [x] 完了した別作業\n",
+        ),
     ];
-    for (day, group, task) in days {
+    for (day, rows) in days {
         let post = dir.join(format!("posts/2026/01/{day:02}"));
         std::fs::create_dir_all(&post).expect("作れる");
         let date = format!("2026-01-{day:02}");
         let body = format!(
-            "# {date}\n\n<!-- acta:comment\nid: id-{day}\ncreated: {date} 09:00\ncreated_ms: {day}\ntags: ToDo\n-->\n# ToDo: {date}\n- {group}\n  - {task}\n<!-- /acta:comment -->\n\n"
+            "# {date}\n\n<!-- acta:comment\nid: id-{day}\ncreated: {date} 09:00\ncreated_ms: {day}\ntags: ToDo\n-->\n# ToDo: {date}\n{rows}<!-- /acta:comment -->\n\n"
         );
         std::fs::write(post.join(format!("{date}.md")), body).expect("書ける");
     }
@@ -139,25 +142,181 @@ fn todo_titles(app: &App) -> Vec<String> {
         .collect()
 }
 
-/// 既定は日付の新しい順。
+/// ノートの本文からもタスクを選んで進められる。
 #[test]
-fn todos_are_sorted_by_date_first() {
+fn note_body_tasks_can_be_cycled() {
+    let (mut app, dir) = seeded_todos("notebody");
+    app.update(Msg::SwitchView(View::Notes));
+
+    // 本文側へ移ると、タスク行が選べる。
+    app.update(Msg::ToggleFocus);
+    assert_eq!(app.note_task_positions().len(), 3, "タスク行を拾えていない");
+
+    // 2 番目（進行中の別作業）を選んで進める。
+    app.update(Msg::Move(Move::Down));
+    app.update(Msg::CycleTodo);
+
+    let text = note_text(&dir, "2026-01-03");
+    assert!(
+        text.contains("- [x] 進行中の別作業"),
+        "選んだ行が変わっていない: {text}"
+    );
+    assert!(
+        text.contains("- [ ] 未着手の作業"),
+        "別の行を変えている: {text}"
+    );
+
+    // ToDo 一覧にも同じ状態が出る。
+    let item = app
+        .todos
+        .iter()
+        .find(|(_, t)| t.title == "進行中の別作業")
+        .expect("ある");
+    assert_eq!(item.1.status, TaskStatus::Done);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 一覧側にいる間の Space は、本文へ移るだけ。
+#[test]
+fn space_moves_into_the_note_body_first() {
+    let (mut app, dir) = seeded_todos("notefocus");
+    app.update(Msg::SwitchView(View::Notes));
+    let before = note_text(&dir, "2026-01-03");
+
+    app.update(Msg::CycleTodo);
+    assert_eq!(app.focus, Focus::Detail, "本文側へ移っていない");
+    assert_eq!(note_text(&dir, "2026-01-03"), before, "勝手に変えている");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 選択中のタスク行は本文の中で印が付く。
+#[test]
+fn the_note_body_marks_the_selected_task() {
+    let (mut app, dir) = seeded_todos("notemark");
+    app.update(Msg::SwitchView(View::Notes));
+    app.update(Msg::ToggleFocus);
+
+    let screen = render(&mut app, 100, 24);
+    let lines: Vec<String> = screen.lines().map(squash).collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains("未着手の作業"))
+        .expect("ある");
+    assert!(
+        screen.lines().nth(at).expect("ある").contains("▌"),
+        "選択の印が無い"
+    );
+    // 選んでいない行には付かない。
+    let other = lines
+        .iter()
+        .position(|l| l.contains("進行中の別作業"))
+        .expect("ある");
+    assert!(!screen.lines().nth(other).expect("ある").contains("▌"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ToDo が無いノートでは、本文は今までどおりスクロールする。
+#[test]
+fn notes_without_todos_still_scroll() {
+    let (mut app, dir) = seeded_app("scroll", 1, 30);
+    // 見出しだけのエントリに差し替える。
+    app.update(Msg::EditEntry);
+    let request = app.take_edit_request().expect("要求が出る");
+    let body: String = (1..=40).map(|i| format!("本文 {i}\n")).collect();
+    app.apply_edit(request.target, Some(format!("tags: memo\n\n{body}")));
+
+    app.update(Msg::ToggleFocus);
+    assert!(app.note_task_positions().is_empty());
+    let before = app.detail_scroll;
+    app.update(Msg::Move(Move::Down));
+    assert!(app.detail_scroll > before, "スクロールしていない");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 左は日付の新しい順で、右は選んだ日のタスクだけ。
+#[test]
+fn todos_are_split_by_date() {
     let (app, dir) = seeded_todos("date");
     assert_eq!(app.todo_sort, TodoSort::Date);
     assert_eq!(
+        app.visible_todo_dates(),
+        vec!["2026-01-03", "2026-01-02", "2026-01-01"]
+    );
+    // 既定は先頭の日。その日のぶんだけ出る。
+    assert_eq!(app.selected_todo_date().as_deref(), Some("2026-01-03"));
+    assert_eq!(
         todo_titles(&app),
-        vec!["未着手の作業", "進行中の作業", "完了した作業"]
+        vec!["未着手の作業", "進行中の別作業", "完了した別作業"]
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// f で未完だけに絞れる。
+/// 右ペインはプロジェクト名の見出しを挟んだ階層になる。
+#[test]
+fn the_task_pane_is_grouped_by_project() {
+    let (mut app, dir) = seeded_todos("group");
+    assert_eq!(
+        app.todo_rows(),
+        vec![
+            TodoRow::Group("Alpha".into()),
+            TodoRow::Task(0),
+            TodoRow::Group("Beta".into()),
+            TodoRow::Task(1),
+            TodoRow::Task(2),
+        ]
+    );
+
+    // 画面にも見出しとタスクが階層で出る。
+    // 全角は 2 セル目がスペースで埋まるので、行ごとに詰めてから探す。
+    let screen = render(&mut app, 100, 20);
+    let lines: Vec<String> = screen.lines().map(squash).collect();
+    let alpha = lines
+        .iter()
+        .position(|l| l.contains("Alpha"))
+        .expect("ある");
+    let task = lines
+        .iter()
+        .position(|l| l.contains("未着手の作業"))
+        .expect("ある");
+    assert!(alpha < task, "見出しがタスクの上に無い");
+    // タスクは見出しより深く置く。
+    assert!(
+        screen.lines().nth(task).expect("ある").contains("  [ ]"),
+        "タスクが字下げされていない"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 日を移ると右ペインが入れ替わる。
+#[test]
+fn moving_the_date_changes_the_tasks() {
+    let (mut app, dir) = seeded_todos("switch");
+    app.update(Msg::Move(Move::Down));
+    assert_eq!(app.selected_todo_date().as_deref(), Some("2026-01-02"));
+    assert_eq!(todo_titles(&app), vec!["進行中の作業"]);
+    // タスク側のカーソルは先頭に戻る。
+    assert_eq!(app.todo_sel, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// f で未完だけに絞れる。日付一覧も未完がある日だけになる。
 #[test]
 fn f_shows_only_open_todos() {
     let (mut app, dir) = seeded_todos("open");
     app.update(Msg::ToggleTodoFilter);
     assert!(app.todo_open_only);
-    assert_eq!(todo_titles(&app), vec!["未着手の作業", "進行中の作業"]);
+    assert_eq!(todo_titles(&app), vec!["未着手の作業", "進行中の別作業"]);
+    // 完了しか無い 01-01 は日付一覧から消える。
+    assert_eq!(
+        app.visible_todo_dates(),
+        vec!["2026-01-03", "2026-01-02"],
+        "完了だけの日が残っている"
+    );
 
     // 見出しにも出す。
     let out = squash(&render(&mut app, 100, 20));
@@ -166,11 +325,12 @@ fn f_shows_only_open_todos() {
     // もう一度押すと戻る。
     app.update(Msg::ToggleTodoFilter);
     assert_eq!(todo_titles(&app).len(), 3);
+    assert_eq!(app.visible_todo_dates().len(), 3);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// s で並び順が巡回する。
+/// s で並び順が巡回する。並ぶのは選んだ日の中。
 #[test]
 fn s_cycles_the_sort_order() {
     let (mut app, dir) = seeded_todos("sort");
@@ -179,15 +339,15 @@ fn s_cycles_the_sort_order() {
     assert_eq!(app.todo_sort, TodoSort::Status);
     assert_eq!(
         todo_titles(&app),
-        vec!["未着手の作業", "進行中の作業", "完了した作業"]
+        vec!["未着手の作業", "進行中の別作業", "完了した別作業"]
     );
 
     app.update(Msg::CycleTodoSort);
     assert_eq!(app.todo_sort, TodoSort::Project);
-    // プロジェクト名順。同じ名前の中では日付の新しい順が残る。
+    // プロジェクト名順。同じ名前の中では書かれた順が残る。
     assert_eq!(
         todo_titles(&app),
-        vec!["進行中の作業", "未着手の作業", "完了した作業"]
+        vec!["未着手の作業", "進行中の別作業", "完了した別作業"]
     );
 
     app.update(Msg::CycleTodoSort);
@@ -203,14 +363,15 @@ fn s_cycles_the_sort_order() {
 #[test]
 fn changing_the_order_keeps_the_selection() {
     let (mut app, dir) = seeded_todos("keep");
-    // 3 番目（完了した作業）を選ぶ。
+    // 末尾（完了した別作業）を選ぶ。
+    app.update(Msg::ToggleFocus);
     app.update(Msg::Move(Move::Bottom));
-    assert_eq!(app.visible_todos()[app.todo_sel].1.title, "完了した作業");
+    assert_eq!(app.visible_todos()[app.todo_sel].1.title, "完了した別作業");
 
     app.update(Msg::CycleTodoSort);
     assert_eq!(
         app.visible_todos()[app.todo_sel].1.title,
-        "完了した作業",
+        "完了した別作業",
         "別の行に移っている"
     );
 
@@ -227,17 +388,40 @@ fn changing_the_order_keeps_the_selection() {
 fn space_hits_the_right_row_while_filtered() {
     let (mut app, dir) = seeded_todos("filtered");
     app.update(Msg::ToggleTodoFilter);
-    // 未完のうち 2 番目（進行中の作業）。
+    // タスク側へ移ってから、未完のうち 2 番目（進行中の別作業）を選ぶ。
+    app.update(Msg::ToggleFocus);
     app.update(Msg::Move(Move::Down));
-    assert_eq!(app.visible_todos()[app.todo_sel].1.title, "進行中の作業");
+    assert_eq!(app.visible_todos()[app.todo_sel].1.title, "進行中の別作業");
 
     app.update(Msg::CycleTodo);
 
-    // 進行中 → 完了になり、絞り込みから外れる。
-    let text = note_text(&dir, "2026-01-02");
+    // 選んだ行だけが変わる。
+    let text = note_text(&dir, "2026-01-03");
     assert!(
-        text.contains("- [x] 進行中の作業"),
+        text.contains("- [x] 進行中の別作業"),
+        "選んだ行が変わっていない: {text}"
+    );
+    assert!(
+        text.contains("- [ ] 未着手の作業"),
         "別の行を変えている: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 日付側にいる間の Space は、タスク側へ移るだけ。
+#[test]
+fn space_moves_to_the_task_pane_first() {
+    let (mut app, dir) = seeded_todos("todofocus");
+    assert_eq!(app.focus, Focus::List);
+    let before = note_text(&dir, "2026-01-03");
+
+    app.update(Msg::CycleTodo);
+    assert_eq!(app.focus, Focus::Detail, "タスク側へ移っていない");
+    assert_eq!(
+        note_text(&dir, "2026-01-03"),
+        before,
+        "一番上を勝手に変えている"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -959,6 +1143,7 @@ fn changing_a_task_status_updates_the_todo_view() {
 fn checking_a_todo_updates_the_project() {
     let (mut app, dir) = with_todays_todo("back");
     app.update(Msg::SwitchView(View::Todo));
+    app.update(Msg::ToggleFocus);
     assert_eq!(app.visible_todos()[0].1.title, "進行中のタスク");
 
     app.update(Msg::CycleTodo);
@@ -1113,6 +1298,7 @@ fn the_task_cursor_is_always_visible() {
 fn cycling_keeps_both_sides_in_step() {
     let (mut app, dir) = with_todays_todo("roundtrip");
     app.update(Msg::SwitchView(View::Todo));
+    app.update(Msg::ToggleFocus);
 
     for expected in ["Done", "Backlog", "InProgress"] {
         app.update(Msg::CycleTodo);
