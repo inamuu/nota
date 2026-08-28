@@ -88,10 +88,15 @@ impl TodoSort {
     }
 }
 
-/// ビュー内のフォーカス。左の一覧か、右の本文か。
+/// ビュー内のフォーカス。左から順に並べてある。
+///
+/// ノートビューだけ 3 ペインで、日付 → エントリ → 本文と移る。
+/// 他のビューは `List` と `Detail` の 2 つだけを使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     List,
+    /// ノートビューの中央ペイン（エントリ一覧）。
+    Entries,
     Detail,
 }
 
@@ -112,7 +117,12 @@ pub enum Msg {
     NextView,
     PrevView,
     Move(Move),
-    ToggleFocus,
+    /// フォーカスを右のペインへ。端では止まる。
+    FocusRight,
+    /// フォーカスを左のペインへ。端では止まる。
+    FocusLeft,
+    /// フォーカスを右へ 1 つ。一番右まで行ったら左端へ戻る。
+    FocusCycle,
     /// ToDo のチェック状態を 1 段進める。
     CycleTodo,
     Reload,
@@ -134,6 +144,10 @@ pub enum Msg {
     NewProject,
     /// 選択中のプロジェクトを 1 つ下 / 上へ動かす。
     MoveProject(i32),
+    /// 選択中のプロジェクトをアーカイブする / 戻す。
+    ToggleArchiveProject,
+    /// 表示中の ToDo を Markdown でクリップボードへ。
+    CopyTodo,
     /// 削除の確認を始める。
     DeleteEntry,
     ConfirmYes,
@@ -158,25 +172,62 @@ pub enum TodoRow {
 }
 
 /// 本文ペインの 1 行。描画とスクロール位置の計算で共用する。
+///
+/// 本文ペインに出るのは選択中のエントリ 1 件だけなので、どのエントリの行かは持たない。
 #[derive(Debug, Clone)]
 pub struct DetailLine {
     pub text: String,
     pub kind: LineKind,
-    /// この行が属するエントリ。ヘッダ行も含む。
-    pub entry_idx: usize,
     /// ToDo のタスク行なら、ファイル内の行番号。本文で選んで進めるのに使う。
     pub task_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
-    /// エントリの区切り（時刻とタグ）。
-    Header,
     Heading,
     ListItem,
     Quote,
     Code,
     Body,
+}
+
+/// ToDo の 1 行を (プロジェクト名, タイトル, 状態) で表したもの。
+/// プロジェクトへ書き戻すときの受け渡しに使う。
+type TodoRowRef = (String, String, TaskStatus);
+
+/// プロジェクトへ反映した結果。状態行に出す文言を組み立てる。
+#[derive(Debug, Clone, Copy, Default)]
+struct ProjectSync {
+    /// 書き換えたプロジェクトの数。
+    projects: usize,
+    added: usize,
+    removed: usize,
+}
+
+impl ProjectSync {
+    fn detail(self) -> Option<String> {
+        if self.projects == 0 {
+            return None;
+        }
+        let mut out = format!("プロジェクト {} 件に反映", self.projects);
+        if self.added > 0 {
+            out.push_str(&format!("・{} 件追加", self.added));
+        }
+        if self.removed > 0 {
+            out.push_str(&format!("・{} 件削除", self.removed));
+        }
+        Some(out)
+    }
+}
+
+/// 中央ペインに出すエントリ 1 件の見出し。
+#[derive(Debug, Clone)]
+pub struct EntrySummary {
+    /// 時刻。Acta が書いたその日の最初のエントリは日付だけなので、無いこともある。
+    pub time: Option<String>,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub todo: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +254,8 @@ pub struct App {
     pub focus: Focus,
 
     pub note_sel: usize,
+    /// ノートビューの中央ペイン（エントリ一覧）のカーソル。
+    pub entry_sel: usize,
     pub detail_scroll: usize,
     /// 本文ペインで選んでいる ToDo タスクの通し番号。
     pub note_task_sel: usize,
@@ -262,6 +315,7 @@ impl App {
             mode: Mode::Normal,
             focus: Focus::List,
             note_sel: 0,
+            entry_sel: 0,
             detail_scroll: 0,
             note_task_sel: 0,
             todo_date_sel: 0,
@@ -306,12 +360,9 @@ impl App {
             Msg::SwitchView(view) => self.switch_view(view),
             Msg::NextView => self.cycle_view(1),
             Msg::PrevView => self.cycle_view(-1),
-            Msg::ToggleFocus => {
-                self.focus = match self.focus {
-                    Focus::List => Focus::Detail,
-                    Focus::Detail => Focus::List,
-                };
-            }
+            Msg::FocusRight => self.move_focus(1),
+            Msg::FocusLeft => self.move_focus(-1),
+            Msg::FocusCycle => self.cycle_focus(),
             Msg::Move(m) => self.apply_move(m),
             Msg::CycleTodo => {
                 if self.view == View::Projects {
@@ -393,6 +444,8 @@ impl App {
             }
             Msg::TodayTodo => self.start_today_todo(),
             Msg::MoveProject(delta) => self.move_project(delta),
+            Msg::ToggleArchiveProject => self.toggle_archive_project(),
+            Msg::CopyTodo => self.copy_todo(),
             Msg::NewProject => {
                 self.pending_edit = Some(EditRequest {
                     target: EditTarget::NewProject,
@@ -407,6 +460,33 @@ impl App {
                 self.mode = Mode::Normal;
             }
         }
+    }
+
+    /// そのビューのペインを左から並べたもの。ノートビューだけ 3 ペインある。
+    fn focus_lanes(&self) -> &'static [Focus] {
+        if self.view == View::Notes {
+            &[Focus::List, Focus::Entries, Focus::Detail]
+        } else {
+            &[Focus::List, Focus::Detail]
+        }
+    }
+
+    /// フォーカスを隣のペインへ移す。端では止まる。h / l 用。
+    fn move_focus(&mut self, delta: i32) {
+        let lanes = self.focus_lanes();
+        let at = lanes.iter().position(|f| *f == self.focus).unwrap_or(0) as i32;
+        let next = (at + delta).clamp(0, lanes.len() as i32 - 1) as usize;
+        self.focus = lanes[next];
+    }
+
+    /// フォーカスを右へ 1 つ。一番右まで行ったら左端へ戻る。
+    ///
+    /// Enter だけで一周できるようにする。右端で押しても何も起きないと、
+    /// 戻り方が分からないまま行き止まりになる。
+    fn cycle_focus(&mut self) {
+        let lanes = self.focus_lanes();
+        let at = lanes.iter().position(|f| *f == self.focus).unwrap_or(0);
+        self.focus = lanes[(at + 1) % lanes.len()];
     }
 
     /// 起動直後のロゴを出す時間帯か。
@@ -464,6 +544,8 @@ impl App {
         let Some(note) = self.notes.get_mut(note_idx) else {
             return;
         };
+        // 編集前の ToDo 行を控えておく。あとで見比べて増減をプロジェクトへ送る。
+        let before_rows = note.entry_todo_rows(entry_idx);
         let before = note.to_text();
         if !note.replace_entry_body(entry_idx, &body) {
             self.status = Some("エントリが見つかりません".into());
@@ -473,11 +555,18 @@ impl App {
         if note.entries[entry_idx].tags != tags {
             note.set_entry_tags(entry_idx, &tags);
         }
+        // ToDo でなくなったときは何もしない。タグを消しただけで
+        // プロジェクトのタスクが消えてしまうと取り返しがつかない。
+        let still_todo = note.entries.get(entry_idx).is_some_and(|e| note.is_todo(e));
+        let after_rows = note.entry_todo_rows(entry_idx);
         self.persist(note_idx, before, "保存しました");
-        // エディタでチェックを書き換えた分もプロジェクトへ送る。
-        let changed = self.sync_projects_from_note(note_idx);
-        if changed > 0 {
-            self.status = Some(format!("保存しました（プロジェクト {changed} 件にも反映）"));
+        if !still_todo {
+            return;
+        }
+        // エディタで書き換えた分をプロジェクトへ送る。増減もそのまま反映する。
+        let sync = self.apply_project_changes(&before_rows, &after_rows, true);
+        if let Some(detail) = sync.detail() {
+            self.status = Some(format!("保存しました（{detail}）"));
         }
     }
 
@@ -592,6 +681,93 @@ impl App {
         ));
     }
 
+    /// 選択中のプロジェクトをアーカイブする / 戻す。
+    fn toggle_archive_project(&mut self) {
+        if self.view != View::Projects {
+            self.status = Some("プロジェクトビューで切り替えます".into());
+            return;
+        }
+        let Some(idx) = self.visible_projects().get(self.project_sel).copied() else {
+            self.status = Some("プロジェクトがありません".into());
+            return;
+        };
+        let project = &self.projects[idx];
+        let (name, archived) = (project.name.clone(), project.is_archived());
+        let now = chrono::Local::now().timestamp_millis();
+        // 戻すときは 0 を書く。Acta もアーカイブの有無をこの値だけで見ている。
+        let at = if archived { 0 } else { now };
+        if let Err(err) = self.store.set_project_archived(project, at, now) {
+            self.status = Some(format!("保存に失敗しました: {err}"));
+            return;
+        }
+        self.reload_projects();
+        // アーカイブすると一覧から消えることがある。選択を収める。
+        let len = self.visible_projects().len();
+        if self.project_sel >= len {
+            self.project_sel = len.saturating_sub(1);
+        }
+        self.task_sel = 0;
+        self.status = Some(if archived {
+            format!("{name} をアーカイブから戻しました")
+        } else {
+            format!("{name} をアーカイブしました（A で表示）")
+        });
+    }
+
+    /// 表示中の ToDo を Markdown にしてクリップボードへ。
+    fn copy_todo(&mut self) {
+        if self.view != View::Todo {
+            self.status = Some("ToDo ビュー（2）でコピーできます".into());
+            return;
+        }
+        let Some(text) = self.todo_markdown() else {
+            self.status = Some("コピーする ToDo がありません".into());
+            return;
+        };
+        let rows = text.lines().count();
+        match crate::clipboard::copy(&text) {
+            Ok(command) => {
+                self.status = Some(format!(
+                    "ToDo を Markdown でコピーしました（{rows} 行 / {command}）"
+                ))
+            }
+            Err(err) => self.status = Some(format!("コピーできません: {err}")),
+        }
+    }
+
+    /// いま右ペインに出ている ToDo を Markdown にする。
+    ///
+    /// 並び替えや絞り込みをそのまま反映する。画面で整えたものが、
+    /// そのまま貼り付けられるようにするため。
+    pub fn todo_markdown(&self) -> Option<String> {
+        let date = self.selected_todo_date()?;
+        let todos = self.visible_todos();
+        if todos.is_empty() {
+            return None;
+        }
+        let heading = match chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
+            Ok(day) => crate::model::todo_heading(day),
+            Err(_) => format!("ToDo: {date}"),
+        };
+        let mut out = vec![format!("# {heading}")];
+        for row in self.todo_rows() {
+            match row {
+                TodoRow::Group(name) => out.push(format!("- {name}")),
+                TodoRow::Task(at) => {
+                    let item = &todos[at].1;
+                    // プロジェクトの無い行は見出しが出ないので、字下げもしない。
+                    let indent = if item.group.is_empty() { "" } else { "  " };
+                    out.push(format!(
+                        "{indent}- [{}] {}",
+                        item.status.marker(),
+                        item.title
+                    ));
+                }
+            }
+        }
+        Some(out.join("\n"))
+    }
+
     /// 名前を受け取ってプロジェクトを作る。最初の中身のある行だけを見る。
     fn create_project(&mut self, text: &str) {
         let Some(name) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
@@ -634,6 +810,14 @@ impl App {
             self.status = Some("タスクとして読み取れる行がありませんでした".into());
             return;
         }
+        // 今日の ToDo から消す行を控えておく。
+        let before: Vec<String> = project.tasks.iter().map(|t| t.title.clone()).collect();
+        let removed: Vec<String> = before
+            .iter()
+            .filter(|title| !tasks.iter().any(|(_, t)| t == *title))
+            .cloned()
+            .collect();
+
         let now = chrono::Local::now().timestamp_millis();
         if let Err(err) = self.store.save_project_tasks(project, &tasks, now) {
             self.status = Some(format!("保存に失敗しました: {err}"));
@@ -642,14 +826,19 @@ impl App {
         let name = project.name.clone();
         self.reload_projects();
         self.status = Some(format!("タスクを保存しました（{} 件）", tasks.len()));
-        self.sync_today_todo(&name);
+        self.sync_today_todo(&name, &removed);
     }
 
     /// プロジェクトのタスクを今日の ToDo に流し込む。
     ///
-    /// 今日の ToDo がまだ無いときは何もしない。プロジェクトをいじるたびに
+    /// 今日の ToDo に出すのは進行中のタスクだけ。未着手まで並べると、
+    /// まだ手を付けないつもりの予定でその日が埋まってしまう。
+    ///
+    /// `removed` はタスク一覧を編集して消えた行。その行は ToDo からも消す。
+    ///
+    /// 今日の ToDo がまだ無いときは作らない。プロジェクトをいじるたびに
     /// ノートが勝手に増えるのは驚きが大きいので、作るのは t に任せる。
-    fn sync_today_todo(&mut self, project_name: &str) {
+    fn sync_today_todo(&mut self, project_name: &str, removed: &[String]) {
         // 添字で持ち回らない。保存で updatedAtMs が変わると一覧の並びが変わる。
         let Some(project) = self.projects.iter().find(|p| p.name == project_name) else {
             return;
@@ -668,26 +857,42 @@ impl App {
                 )
             })
             .collect();
-        if tasks.is_empty() {
+        if tasks.is_empty() && removed.is_empty() {
             return;
         }
 
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let Some(note_idx) = self.notes.iter().position(|n| n.date == date) else {
-            return;
-        };
-        let note = &self.notes[note_idx];
-        let Some(entry_idx) = note.entries.iter().position(|e| note.is_todo(e)) else {
+        let today_todo = self
+            .notes
+            .iter()
+            .position(|n| n.date == date)
+            .and_then(|at| {
+                let note = &self.notes[at];
+                note.entries
+                    .iter()
+                    .position(|e| note.is_todo(e))
+                    .map(|entry| (at, entry))
+            });
+        let Some((note_idx, entry_idx)) = today_todo else {
+            // 黙って落とさない。t で作れば入ることが分かるようにする。
+            if tasks.iter().any(|(_, _, append)| *append) {
+                self.status = Some(
+                    "タスクを保存しました（今日の ToDo がまだ無いので反映していません。t で作れます）"
+                        .to_string(),
+                );
+            }
             return;
         };
 
+        let note = &self.notes[note_idx];
         let body: Vec<String> = note
             .body_of(&note.entries[entry_idx])
             .into_iter()
             .map(str::to_string)
             .collect();
-        let (next, added, updated) = crate::model::upsert_todo_group(&body, &name, &tasks);
-        if added == 0 && updated == 0 {
+        let (next, put, updated, dropped) =
+            crate::model::upsert_todo_group(&body, &name, &tasks, removed);
+        if put == 0 && updated == 0 && dropped == 0 {
             return;
         }
 
@@ -696,11 +901,13 @@ impl App {
         if !note.replace_entry_body(entry_idx, &next.join("\n")) {
             return;
         }
-        let detail = match (added, updated) {
-            (a, 0) => format!("今日の ToDo に {a} 件追加しました"),
-            (0, u) => format!("今日の ToDo の {u} 件を更新しました"),
-            (a, u) => format!("今日の ToDo に {a} 件追加、{u} 件更新しました"),
-        };
+        // 何をしたかを 1 行にまとめる。0 件のものは出さない。
+        let parts: Vec<String> = [(put, "追加"), (updated, "更新"), (dropped, "削除")]
+            .into_iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, label)| format!("{count} 件{label}"))
+            .collect();
+        let detail = format!("今日の ToDo に {}しました", parts.join("、"));
         self.persist(note_idx, before, &detail);
     }
 
@@ -758,11 +965,7 @@ impl App {
 
         // 並びは現在の表示順のまま、対象だけ状態を変える。
         let mut tasks: Vec<(TaskStatus, String)> = Vec::new();
-        for status in [
-            TaskStatus::InProgress,
-            TaskStatus::Backlog,
-            TaskStatus::Done,
-        ] {
+        for status in crate::model::STATUS_ORDER {
             for task in project.tasks_with(status) {
                 let status = if task.title == title { next } else { status };
                 tasks.push((status, task.title.clone()));
@@ -781,7 +984,8 @@ impl App {
             self.task_sel = at;
         }
         self.status = Some(format!("{title} → {}", next.label()));
-        self.sync_today_todo(&project_name);
+        // Space は状態を変えるだけ。行の増減は起きない。
+        self.sync_today_todo(&project_name, &[]);
     }
 
     /// 今日の ToDo を編集する。まだ無ければ、進行中のタスクを並べた雛形を出す。
@@ -868,6 +1072,11 @@ impl App {
                     return;
                 }
                 self.detail_scroll = 0;
+                self.note_task_sel = 0;
+                let len = self.notes[note_idx].entries.len();
+                if self.entry_sel >= len {
+                    self.entry_sel = len.saturating_sub(1);
+                }
                 self.persist(note_idx, before, "削除しました");
             }
         }
@@ -878,12 +1087,9 @@ impl App {
         let now = chrono::Local::now();
         let date = now.format("%Y-%m-%d").to_string();
         let exists = self.store.note_exists(&date);
-        // Acta と同じ規則。その日の最初のエントリは日付だけ、以降は時刻も入れる。
-        let created = if exists {
-            now.format("%Y-%m-%d %H:%M").to_string()
-        } else {
-            date.clone()
-        };
+        // その日の最初のエントリでも時刻を入れる。Acta は日付だけを書くが、
+        // それだと ToDo を作った時刻が分からなくなる。読む側は同じ形で解釈できる。
+        let created = now.format("%Y-%m-%d %H:%M").to_string();
         let block = format_entry_block(
             &uuid::Uuid::new_v4().to_string(),
             &created,
@@ -919,12 +1125,10 @@ impl App {
         if self.note_sel >= self.visible_notes() {
             self.show_all_notes = true;
         }
-        // 追加したエントリは末尾なので、そこまでスクロールする。
-        self.detail_scroll = self
-            .detail_lines()
-            .iter()
-            .position(|l| l.entry_idx == self.notes[self.note_sel].entries.len().saturating_sub(1))
-            .unwrap_or(0);
+        // 追加したエントリは末尾なので、そこを選んだ状態にする。
+        self.entry_sel = self.notes[self.note_sel].entries.len().saturating_sub(1);
+        self.detail_scroll = 0;
+        self.note_task_sel = 0;
         self.status = Some("エントリを追加しました".into());
     }
 
@@ -933,16 +1137,8 @@ impl App {
         match self.view {
             View::Notes => {
                 let note = self.notes.get(self.note_sel)?;
-                if note.entries.is_empty() {
-                    return None;
-                }
-                // 本文ペインのスクロール位置にあるエントリを対象にする。
-                let lines = self.detail_lines();
-                let entry_idx = lines
-                    .get(self.detail_scroll.min(lines.len().saturating_sub(1)))
-                    .map(|l| l.entry_idx)
-                    .unwrap_or(0);
-                Some((self.note_sel, entry_idx))
+                // 中央ペインで選んでいるエントリがそのまま対象になる。
+                (self.entry_sel < note.entries.len()).then_some((self.note_sel, self.entry_sel))
             }
             View::Todo => {
                 let (note_idx, item) = self.visible_todos().get(self.todo_sel).copied()?;
@@ -1006,6 +1202,19 @@ impl App {
             self.help_scroll = shift(self.help_scroll, m, usize::MAX - 1, 5);
             return;
         }
+        // 中央ペインにいるときは、その日のエントリを選ぶ。
+        if self.view == View::Notes && self.focus == Focus::Entries {
+            let len = self.selected_note().map(|n| n.entries.len()).unwrap_or(0);
+            if len == 0 {
+                self.entry_sel = 0;
+                return;
+            }
+            self.entry_sel = shift(self.entry_sel, m, len - 1, self.viewport);
+            // エントリを移ったら本文側の位置は先頭に戻す。
+            self.detail_scroll = 0;
+            self.note_task_sel = 0;
+            return;
+        }
         // 本文ペインにフォーカスがあるとき。ToDo のタスクがあればその行を選び、
         // 無ければ今までどおりスクロールする。
         if self.view == View::Notes && self.focus == Focus::Detail {
@@ -1055,7 +1264,10 @@ impl App {
         let page = self.viewport;
         *sel = shift(*sel, m, len - 1, page);
         if self.view == View::Notes {
+            // 日を移ったらエントリのカーソルも先頭に戻す。
+            self.entry_sel = 0;
             self.detail_scroll = 0;
+            self.note_task_sel = 0;
         }
         if self.view == View::Projects {
             self.task_sel = 0;
@@ -1123,27 +1335,57 @@ impl App {
     /// 行のグループ名とタスク名で探す。手で足した行のようにプロジェクトに
     /// 対応が無いものは、そのまま ToDo だけの予定として置いておく。
     /// 戻り値は書き換えたプロジェクトの数。
-    fn sync_projects_from_rows(&mut self, rows: &[(String, String, TaskStatus)]) -> usize {
+    fn sync_projects_from_rows(&mut self, rows: &[TodoRowRef]) -> usize {
+        self.apply_project_changes(rows, rows, false).projects
+    }
+
+    /// ToDo の行をプロジェクトのタスクへ反映する。
+    ///
+    /// `before` と `after` を見比べるので、状態だけでなく行の増減も送れる。
+    /// `allow_add_remove` が false のときは状態だけを合わせる。Space のように
+    /// 1 行だけ触った操作で、他の行が消えてしまわないようにするため。
+    fn apply_project_changes(
+        &mut self,
+        before: &[TodoRowRef],
+        after: &[TodoRowRef],
+        allow_add_remove: bool,
+    ) -> ProjectSync {
         // プロジェクトごとにまとめてから書く。1 行ずつ保存すると、
         // 同じファイルを何度も開くうえに更新時刻も無駄に動く。
         let mut groups: Vec<String> = Vec::new();
-        for (group, _, _) in rows {
+        for (group, _, _) in after.iter().chain(before.iter()) {
             if !group.is_empty() && !groups.contains(group) {
                 groups.push(group.clone());
             }
         }
 
-        let mut changed = 0;
+        let mut sync = ProjectSync::default();
         for group in groups {
-            let Some(project) = self.projects.iter().find(|p| p.name == group) else {
+            let Some(idx) = self.projects.iter().position(|p| p.name == group) else {
                 continue;
             };
-            // その行が指すタスクだけ状態を差し替える。並びは今のまま。
-            let tasks: Vec<(TaskStatus, String)> = project
+            // ToDo から消えた行。編集前にあって、いま無いものだけを対象にする。
+            // 元から ToDo に出ていなかったタスクは触らない。
+            let removed: Vec<&str> = if allow_add_remove {
+                before
+                    .iter()
+                    .filter(|(g, title, _)| {
+                        *g == group && !after.iter().any(|(g2, t2, _)| *g2 == group && t2 == title)
+                    })
+                    .map(|(_, title, _)| title.as_str())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let project = &self.projects[idx];
+            // 残すタスクは並びも項目もそのまま。状態だけ ToDo 側に合わせる。
+            let mut tasks: Vec<(TaskStatus, String)> = project
                 .tasks
                 .iter()
+                .filter(|t| !removed.contains(&t.title.as_str()))
                 .map(|t| {
-                    let next = rows
+                    let next = after
                         .iter()
                         .find(|(g, title, _)| *g == group && *title == t.title)
                         .map(|(_, _, status)| *status)
@@ -1151,45 +1393,46 @@ impl App {
                     (next, t.title.clone())
                 })
                 .collect();
-            // すでに同じ状態なら書かない。更新時刻をむやみに動かさない。
-            if tasks
-                .iter()
-                .zip(project.tasks.iter())
-                .all(|((next, _), t)| *next == t.status)
-            {
+            // ToDo で足した行はプロジェクトの末尾に置く。
+            let mut added = 0;
+            if allow_add_remove {
+                for (g, title, status) in after {
+                    if *g != group || tasks.iter().any(|(_, t)| t == title) {
+                        continue;
+                    }
+                    tasks.push((*status, title.clone()));
+                    added += 1;
+                }
+            }
+
+            // すでに同じ内容なら書かない。更新時刻をむやみに動かさない。
+            let same = added == 0
+                && removed.is_empty()
+                && tasks
+                    .iter()
+                    .zip(project.tasks.iter())
+                    .all(|((next, _), t)| *next == t.status);
+            if same {
                 continue;
             }
 
             let now = chrono::Local::now().timestamp_millis();
-            if let Err(err) = self.store.save_project_tasks(project, &tasks, now) {
+            if let Err(err) = self
+                .store
+                .save_project_tasks(&self.projects[idx], &tasks, now)
+            {
                 self.status = Some(format!("プロジェクトに反映できません: {err}"));
                 continue;
             }
-            changed += 1;
+            sync.projects += 1;
+            sync.added += added;
+            sync.removed += removed.len();
         }
 
-        if changed > 0 {
+        if sync.projects > 0 {
             self.reload_projects();
         }
-        changed
-    }
-
-    /// ノートの中の ToDo 行をまとめてプロジェクトへ反映する。
-    /// エディタで直接チェックを書き換えたときに使う。
-    fn sync_projects_from_note(&mut self, note_idx: usize) -> usize {
-        let Some(note) = self.notes.get(note_idx) else {
-            return 0;
-        };
-        let rows: Vec<(String, String, TaskStatus)> = note
-            .todo_items()
-            .into_iter()
-            .filter(|item| !item.group.is_empty())
-            .map(|item| (item.group, item.title, item.status))
-            .collect();
-        if rows.is_empty() {
-            return 0;
-        }
-        self.sync_projects_from_rows(&rows)
+        sync
     }
 
     fn reload(&mut self) {
@@ -1211,6 +1454,8 @@ impl App {
     fn clamp_all(&mut self) {
         let visible = self.visible_notes();
         clamp(&mut self.note_sel, visible);
+        let entries = self.selected_note().map(|n| n.entries.len()).unwrap_or(0);
+        clamp(&mut self.entry_sel, entries);
         let visible = self.visible_todos().len();
         clamp(&mut self.todo_sel, visible);
         clamp(&mut self.project_sel, self.projects.len());
@@ -1376,88 +1621,90 @@ impl App {
             self.show_all_notes = true;
         }
         self.note_sel = hit.note_idx;
-        self.detail_scroll = self.entry_offset(hit.note_idx, hit.entry_idx);
-    }
-
-    /// 本文ペインの何行目にそのエントリが現れるか。検索からのジャンプで使う。
-    fn entry_offset(&self, note_idx: usize, entry_idx: usize) -> usize {
-        let lines = self.detail_lines_of(note_idx);
-        lines
-            .iter()
-            .position(|l| l.entry_idx == entry_idx)
-            .unwrap_or(0)
+        self.entry_sel = hit.entry_idx;
+        self.detail_scroll = 0;
+        self.note_task_sel = 0;
     }
 
     pub fn selected_note(&self) -> Option<&DailyNote> {
         self.notes.get(self.note_sel)
     }
 
+    /// 本文ペインの行。選択中のエントリ 1 件ぶんだけを返す。
     pub fn detail_lines(&self) -> Vec<DetailLine> {
-        self.detail_lines_of(self.note_sel)
+        self.entry_lines(self.note_sel, self.entry_sel)
     }
 
-    fn detail_lines_of(&self, note_idx: usize) -> Vec<DetailLine> {
+    fn entry_lines(&self, note_idx: usize, entry_idx: usize) -> Vec<DetailLine> {
         let Some(note) = self.notes.get(note_idx) else {
+            return Vec::new();
+        };
+        let Some(entry) = note.entries.get(entry_idx) else {
             return Vec::new();
         };
         // ToDo のタスク行はファイル行番号で覚えておき、本文からも進められるようにする。
         let task_lines: Vec<usize> = note.todo_items().iter().map(|i| i.line).collect();
 
         let mut out = Vec::new();
-        for (entry_idx, entry) in note.entries.iter().enumerate() {
-            let tags = if entry.tags.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", entry.tags.join(" · "))
-            };
-            // エントリの頭に区切りを置くと、どこから始まるか目で追える。
-            out.push(DetailLine {
-                text: format!("── {}{}", short_time(&entry.created), tags),
-                kind: LineKind::Header,
-                entry_idx,
-                task_line: None,
-            });
-            let mut in_code = false;
-            for (offset, line) in note.body_of(entry).into_iter().enumerate() {
-                let file_line = entry.body.start + offset;
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("```") {
-                    in_code = !in_code;
-                    out.push(DetailLine {
-                        text: line.to_string(),
-                        kind: LineKind::Code,
-                        entry_idx,
-                        task_line: None,
-                    });
-                    continue;
-                }
-                let kind = if in_code {
-                    LineKind::Code
-                } else if trimmed.starts_with('#') {
-                    LineKind::Heading
-                } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-                    LineKind::ListItem
-                } else if trimmed.starts_with('>') {
-                    LineKind::Quote
-                } else {
-                    LineKind::Body
-                };
+        let mut in_code = false;
+        for (offset, line) in note.body_of(entry).into_iter().enumerate() {
+            let file_line = entry.body.start + offset;
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                in_code = !in_code;
                 out.push(DetailLine {
                     text: line.to_string(),
-                    kind,
-                    entry_idx,
-                    // コードブロックの中の似た行は対象外。todo_items が拾った行だけ。
-                    task_line: (!in_code && task_lines.contains(&file_line)).then_some(file_line),
+                    kind: LineKind::Code,
+                    task_line: None,
                 });
+                continue;
             }
+            let kind = if in_code {
+                LineKind::Code
+            } else if trimmed.starts_with('#') {
+                LineKind::Heading
+            } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                LineKind::ListItem
+            } else if trimmed.starts_with('>') {
+                LineKind::Quote
+            } else {
+                LineKind::Body
+            };
             out.push(DetailLine {
-                text: String::new(),
-                kind: LineKind::Body,
-                entry_idx,
-                task_line: None,
+                text: line.to_string(),
+                kind,
+                // コードブロックの中の似た行は対象外。todo_items が拾った行だけ。
+                task_line: (!in_code && task_lines.contains(&file_line)).then_some(file_line),
             });
         }
         out
+    }
+
+    /// 中央ペインに出すエントリの見出し。時刻・タグ・本文の 1 行目。
+    pub fn entry_summaries(&self) -> Vec<EntrySummary> {
+        let Some(note) = self.selected_note() else {
+            return Vec::new();
+        };
+        note.entries
+            .iter()
+            .map(|entry| {
+                let title = note
+                    .body_of(entry)
+                    .into_iter()
+                    .map(|l| l.trim().trim_start_matches('#').trim())
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("(空)")
+                    .chars()
+                    .take(80)
+                    .collect();
+                EntrySummary {
+                    time: short_time(&entry.created),
+                    title,
+                    tags: entry.tags.clone(),
+                    todo: note.is_todo(entry),
+                }
+            })
+            .collect()
     }
 
     /// ノートの本文で選んでいるタスクの状態を進める。
@@ -1557,11 +1804,7 @@ impl App {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for status in [
-            TaskStatus::InProgress,
-            TaskStatus::Backlog,
-            TaskStatus::Done,
-        ] {
+        for status in crate::model::STATUS_ORDER {
             let tasks = project.tasks_with(status);
             let shown = if status == TaskStatus::Done && self.config.project_done_limit > 0 {
                 self.config.project_done_limit.min(tasks.len())
@@ -1623,12 +1866,11 @@ fn shift(current: usize, m: Move, max: usize, page: usize) -> usize {
     }
 }
 
-/// `2026-02-26 11:25` から時刻部分だけ取る。取れなければそのまま返す。
-fn short_time(created: &str) -> String {
-    created
-        .split_once(' ')
-        .map(|(_, time)| time.to_string())
-        .unwrap_or_else(|| created.to_string())
+/// `2026-02-26 11:25` から時刻部分だけ取る。
+///
+/// Acta が書いたその日の最初のエントリは日付だけなので、時刻が無いこともある。
+fn short_time(created: &str) -> Option<String> {
+    created.split_once(' ').map(|(_, time)| time.to_string())
 }
 
 /// 検索語を含む最初の行を抜き出す。無ければ本文の先頭行。
@@ -1678,7 +1920,7 @@ mod tests {
 
     #[test]
     fn extracts_time_only() {
-        assert_eq!(short_time("2026-02-26 11:25"), "11:25");
-        assert_eq!(short_time("2026-02-26"), "2026-02-26");
+        assert_eq!(short_time("2026-02-26 11:25").as_deref(), Some("11:25"));
+        assert_eq!(short_time("2026-02-26"), None);
     }
 }

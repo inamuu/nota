@@ -155,9 +155,15 @@ fn draw_tabs(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
+    // 3 ペイン。日付 → その日のエントリ → 選んだエントリの本文。
+    // 1 日に複数エントリがあっても、本文には選んだものだけが出る。
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(18), Constraint::Min(20)])
+        .constraints([
+            Constraint::Length(18),
+            Constraint::Length(34),
+            Constraint::Min(20),
+        ])
         .split(area);
 
     let visible = app.visible_notes();
@@ -189,16 +195,60 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
     }
     frame.render_stateful_widget(list, cols[0], &mut state);
 
+    // 中央ペイン。その日のエントリを時刻と 1 行目で並べる。
+    let on_entries = app.focus == Focus::Entries;
+    let summaries = app.entry_summaries();
+    let items: Vec<ListItem> = summaries
+        .iter()
+        .map(|entry| {
+            // 時刻が無いエントリでも行頭を揃えたいので、桁だけ埋める。
+            let mut spans = vec![Span::styled(
+                format!("{} ", entry.time.as_deref().unwrap_or("--:--")),
+                Style::default().fg(DIM),
+            )];
+            if entry.todo {
+                spans.push(Span::styled("● ", Style::default().fg(PROGRESS)));
+            }
+            spans.push(Span::raw(entry.title.clone()));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let title = if summaries.is_empty() {
+        "エントリなし".to_string()
+    } else {
+        format!("エントリ {}", summaries.len())
+    };
+    let list = List::new(items)
+        .block(bordered(&title, on_entries))
+        .highlight_style(cursor_style(on_entries))
+        .highlight_symbol(CURSOR);
+    let mut state = ListState::default();
+    if !summaries.is_empty() {
+        state.select(Some(app.entry_sel));
+    }
+    frame.render_stateful_widget(list, cols[1], &mut state);
+
     // 本文。ページ移動の幅を枠の内側の高さに合わせる。
-    let inner_height = cols[1].height.saturating_sub(2) as usize;
+    let inner_height = cols[2].height.saturating_sub(2) as usize;
     app.viewport = inner_height.max(1);
 
     let on_detail = app.focus == Focus::Detail;
     let tasks = app.note_task_positions();
-    let mut title = app
-        .selected_note()
-        .map(|n| n.date.clone())
-        .unwrap_or_else(|| "ノートがありません".into());
+    // 見出しには日時とタグを出す。中央ペインで選んだものがどれか分かるようにする。
+    let date = app.selected_note().map(|n| n.date.as_str()).unwrap_or("");
+    let mut title = match summaries.get(app.entry_sel) {
+        Some(entry) => {
+            let mut head = date.to_string();
+            if let Some(time) = &entry.time {
+                head.push_str(&format!(" {time}"));
+            }
+            if !entry.tags.is_empty() {
+                head.push_str(&format!("  {}", entry.tags.join(" · ")));
+            }
+            head
+        }
+        None => "エントリがありません".into(),
+    };
     if !tasks.is_empty() {
         title.push_str(if on_detail {
             "  Space で状態を進める"
@@ -206,24 +256,18 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
             "  l で ToDo を選ぶ"
         });
     }
+    // 右端まで来ると戻り方が分からなくなるので、見出しに出しておく。
+    if on_detail {
+        title.push_str("  h で戻る");
+    }
     // いま選んでいるタスク行。本文からも状態を進められる。
     let cursor = tasks.get(app.note_task_sel).copied();
 
-    // エントリの区切りはペイン幅まで伸ばす。境界がひと目で分かる。
-    let inner_width = cols[1].width.saturating_sub(2) as usize;
     let lines: Vec<Line> = app
         .detail_lines()
         .into_iter()
         .enumerate()
         .map(|(at, l)| {
-            if l.kind == LineKind::Header {
-                let span = Span::styled(l.text, style_for(l.kind));
-                let rest = inner_width.saturating_sub(span.width() + 1);
-                return Line::from(vec![
-                    span,
-                    Span::styled(format!(" {}", "─".repeat(rest)), Style::default().fg(DIM)),
-                ]);
-            }
             // タスク行は選択中だけ印を付ける。行頭が動かないよう幅は揃える。
             if l.task_line.is_some() {
                 let selected = cursor == Some(at);
@@ -244,9 +288,9 @@ fn draw_notes(app: &mut App, frame: &mut Frame, area: Rect) {
     let total = lines.len();
     let scroll = app.detail_scroll.min(total.saturating_sub(1)) as u16;
     let paragraph = Paragraph::new(lines)
-        .block(bordered(&title, app.focus == Focus::Detail))
+        .block(bordered(&title, on_detail))
         .scroll((scroll, 0));
-    frame.render_widget(paragraph, cols[1]);
+    frame.render_widget(paragraph, cols[2]);
 }
 
 fn draw_todo(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -333,7 +377,7 @@ fn draw_todo(app: &mut App, frame: &mut Frame, area: Rect) {
     title.push_str(if on_dates {
         "  l で選ぶ"
     } else {
-        "  Space で状態を進める"
+        "  Space で状態を進める  h で戻る"
     });
 
     let list = List::new(items)
@@ -376,11 +420,17 @@ fn draw_projects(app: &mut App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    let title = if app.show_archived {
+    let mut title = if app.show_archived {
         format!("プロジェクト {}（済も表示）", visible.len())
     } else {
         format!("プロジェクト {}", visible.len())
     };
+    if app.focus == Focus::List && !visible.is_empty() {
+        title.push_str(match app.selected_project() {
+            Some(p) if p.is_archived() => "  x で戻す",
+            _ => "  x でアーカイブ",
+        });
+    }
     let list = List::new(items)
         .block(bordered(&title, app.focus == Focus::List))
         .highlight_style(cursor_style(app.focus == Focus::List))
@@ -404,11 +454,7 @@ fn draw_projects(app: &mut App, frame: &mut Frame, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     let visible_tasks = app.visible_tasks();
     let mut at = 0;
-    for status in [
-        TaskStatus::InProgress,
-        TaskStatus::Backlog,
-        TaskStatus::Done,
-    ] {
+    for status in crate::model::STATUS_ORDER {
         let count = visible_tasks.iter().filter(|t| t.status == status).count();
         if count == 0 {
             continue;
@@ -438,7 +484,7 @@ fn draw_projects(app: &mut App, frame: &mut Frame, area: Rect) {
         title.push_str(&format!("（完了 他 {hidden} 件）"));
     }
     title.push_str(if focused {
-        "  Space で状態を進める"
+        "  Space で状態を進める  h で戻る"
     } else {
         "  l で選ぶ"
     });
@@ -626,7 +672,6 @@ fn cursor_style(focused: bool) -> Style {
 
 fn style_for(kind: LineKind) -> Style {
     match kind {
-        LineKind::Header => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         LineKind::Heading => Style::default()
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD),

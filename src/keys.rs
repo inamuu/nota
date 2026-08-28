@@ -17,8 +17,14 @@ pub const HELP: &[(&str, &str)] = &[
         "Tab / Shift-Tab",
         "Menu を順に切り替え（検索の入力中も効く）",
     ),
-    ("h / l", "一覧と本文のフォーカスを移動"),
-    ("Enter", "ノートは本文へ、検索は該当箇所へジャンプ"),
+    (
+        "h / l",
+        "ペインを左 / 右へ移動（ノートは 日付・一覧・本文）",
+    ),
+    (
+        "Enter",
+        "ペインを右へ（右端で左端に戻る）。検索は該当箇所へ",
+    ),
     ("Space", "ToDo / タスクの状態を進める（未着手→進行中→完了）"),
     ("t", "今日の ToDo を開く / 進行中のタスクから作る"),
     ("o", "エントリ / プロジェクトを新しく作る（$EDITOR）"),
@@ -27,6 +33,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("/", "全文検索。Esc で元のビューに戻る"),
     ("a", "ノート一覧を直近だけ / 全件で切り替え"),
     ("A", "アーカイブ済みプロジェクトの表示を切り替え"),
+    ("x", "プロジェクトをアーカイブする / 戻す"),
+    ("c", "表示中の ToDo を Markdown でクリップボードへ"),
     ("s", "ToDo の並び順を変える（日付 / 状態 / プロジェクト）"),
     ("f", "ToDo を未完だけにするか切り替え"),
     ("J / K", "プロジェクトの並びを下 / 上へ入れ替え"),
@@ -95,6 +103,8 @@ fn normal_mode(app: &App, key: KeyEvent, ctrl: bool) -> Option<Msg> {
         KeyCode::Char('r') => Some(Msg::Reload),
         KeyCode::Char('a') => Some(Msg::ToggleAllNotes),
         KeyCode::Char('A') => Some(Msg::ToggleArchived),
+        KeyCode::Char('x') if app.view == View::Projects => Some(Msg::ToggleArchiveProject),
+        KeyCode::Char('c') => Some(Msg::CopyTodo),
         KeyCode::Char('s') => Some(Msg::CycleTodoSort),
         KeyCode::Char('f') => Some(Msg::ToggleTodoFilter),
         KeyCode::Char('J') if app.view == View::Projects => Some(Msg::MoveProject(1)),
@@ -115,9 +125,9 @@ fn normal_mode(app: &App, key: KeyEvent, ctrl: bool) -> Option<Msg> {
         KeyCode::Char('g') | KeyCode::Home => Some(Msg::Move(Move::Top)),
         KeyCode::Char('G') | KeyCode::End => Some(Msg::Move(Move::Bottom)),
 
-        // h/l は本文ペインとの行き来。ノートビューだけ意味を持つ。
-        KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::List => Some(Msg::ToggleFocus),
-        KeyCode::Char('h') | KeyCode::Left if app.focus == Focus::Detail => Some(Msg::ToggleFocus),
+        // h/l はペインの行き来。ノートビューは 3 ペインあるので端でだけ止める。
+        KeyCode::Char('l') | KeyCode::Right if app.focus != Focus::Detail => Some(Msg::FocusRight),
+        KeyCode::Char('h') | KeyCode::Left if app.focus != Focus::List => Some(Msg::FocusLeft),
 
         KeyCode::Char('t') => Some(Msg::TodayTodo),
         KeyCode::Char('o') => Some(Msg::NewEntry),
@@ -127,9 +137,9 @@ fn normal_mode(app: &App, key: KeyEvent, ctrl: bool) -> Option<Msg> {
         KeyCode::Char(' ') => Some(Msg::CycleTodo),
         KeyCode::Enter => match app.view {
             View::Search => Some(Msg::SearchCommit),
-            View::Notes => Some(Msg::ToggleFocus),
+            View::Notes => Some(Msg::FocusCycle),
             View::Todo => Some(Msg::CycleTodo),
-            View::Projects => Some(Msg::ToggleFocus),
+            View::Projects => Some(Msg::FocusCycle),
         },
         // 検索ビューにいるときは Esc で抜ける。それ以外はメッセージを消すだけ。
         KeyCode::Esc if app.view == View::Search => Some(Msg::SearchCancel),
@@ -205,7 +215,7 @@ mod tests {
         ));
     }
 
-    /// フォーカスの向きと逆方向のキーは何もしない。
+    /// 端のペインでは、その先へ向かうキーは何もしない。
     #[test]
     fn focus_keys_respect_current_side() {
         let mut a = app();
@@ -213,12 +223,21 @@ mod tests {
         assert!(handle(&a, press(KeyCode::Char('h'))).is_none());
         assert!(matches!(
             handle(&a, press(KeyCode::Char('l'))),
-            Some(Msg::ToggleFocus)
+            Some(Msg::FocusRight)
+        ));
+        a.focus = Focus::Entries;
+        assert!(matches!(
+            handle(&a, press(KeyCode::Char('h'))),
+            Some(Msg::FocusLeft)
+        ));
+        assert!(matches!(
+            handle(&a, press(KeyCode::Char('l'))),
+            Some(Msg::FocusRight)
         ));
         a.focus = Focus::Detail;
         assert!(matches!(
             handle(&a, press(KeyCode::Char('h'))),
-            Some(Msg::ToggleFocus)
+            Some(Msg::FocusLeft)
         ));
         assert!(handle(&a, press(KeyCode::Char('l'))).is_none());
     }

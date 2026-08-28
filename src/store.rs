@@ -184,14 +184,27 @@ impl Store {
         root["tasks"] = serde_json::Value::Array(next);
         root["updatedAtMs"] = serde_json::Value::from(now_ms);
 
-        // Acta と同じ 2 スペース、末尾の改行なし。
-        let out = serde_json::to_string_pretty(&root).context("JSON を書き出せません")?;
-        let tmp = path.with_extension("json.nota-tmp");
-        std::fs::write(&tmp, &out)
-            .with_context(|| format!("書き込みに失敗しました: {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .with_context(|| format!("置き換えに失敗しました: {}", path.display()))?;
-        Ok(())
+        write_json(&path, &root)
+    }
+
+    /// プロジェクトのアーカイブ状態を書き換える。
+    ///
+    /// タスクと同じく、読んだ JSON の該当項目だけを差し替える。
+    /// `archived_at_ms` が 0 ならアーカイブを解除する。
+    pub fn set_project_archived(
+        &self,
+        project: &Project,
+        archived_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<()> {
+        let path = project.source_dir.join(PROJECT_FILE);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("読み込みに失敗しました: {}", path.display()))?;
+        let mut root: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("JSON として読めません: {}", path.display()))?;
+        root["archivedAtMs"] = serde_json::Value::from(archived_at_ms);
+        root["updatedAtMs"] = serde_json::Value::from(now_ms);
+        write_json(&path, &root)
     }
 
     /// 手で並べた順（ディレクトリ名の並び）。無ければ空。
@@ -251,6 +264,18 @@ impl Store {
     pub fn note_exists(&self, date: &str) -> bool {
         self.note_path(date).map(|p| p.is_file()).unwrap_or(false)
     }
+}
+
+/// project.json を書き戻す。Acta と同じ 2 スペース、末尾の改行なし。
+/// 一時ファイル経由で置き換え、書き込み中に落ちても元が壊れないようにする。
+fn write_json(path: &Path, root: &serde_json::Value) -> Result<()> {
+    let out = serde_json::to_string_pretty(root).context("JSON を書き出せません")?;
+    let tmp = path.with_extension("json.nota-tmp");
+    std::fs::write(&tmp, &out)
+        .with_context(|| format!("書き込みに失敗しました: {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("置き換えに失敗しました: {}", path.display()))?;
+    Ok(())
 }
 
 /// 使われていないディレクトリ名を決める。Acta と同じ規則。

@@ -3,6 +3,7 @@
 //! 操作はすべてキーボードで完結する。マウスは有効化しない。
 
 mod app;
+mod clipboard;
 mod config;
 mod editor;
 mod keys;

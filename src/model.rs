@@ -147,6 +147,14 @@ pub struct Project {
     pub source_dir: PathBuf,
 }
 
+/// タスクを並べる順。Backlog を先頭に置く。まだ進んでいないものが
+/// 上に来ないと、次に何をするかを探しにくい。
+pub const STATUS_ORDER: [TaskStatus; 3] = [
+    TaskStatus::Backlog,
+    TaskStatus::InProgress,
+    TaskStatus::Done,
+];
+
 impl Project {
     pub fn is_archived(&self) -> bool {
         self.archived_at_ms > 0
@@ -164,12 +172,9 @@ impl Project {
     /// タスク一覧をチェックリストにする。これをエディタで開いて編集する。
     pub fn tasks_as_checklist(&self) -> String {
         let mut out = String::new();
-        // 進行中を上に出す。編集するのはたいてい手前のタスク。
-        for status in [
-            TaskStatus::InProgress,
-            TaskStatus::Backlog,
-            TaskStatus::Done,
-        ] {
+        // 画面と同じ並びで出す。保存すると JSON もこの順になるので、
+        // 編集の前後で一覧の並びが動かない。
+        for status in STATUS_ORDER {
             for task in self.tasks_with(status) {
                 out.push_str(&format!("- [{}] {}\n", status.marker(), task.title));
             }
@@ -287,6 +292,32 @@ impl DailyNote {
                 } else if let Some(name) = parse_group_line(line) {
                     group = name;
                 }
+            }
+        }
+        out
+    }
+
+    /// エントリ 1 件の中のタスク行を (グループ, タイトル, 状態) で返す。
+    ///
+    /// 編集の前後で見比べて、増えた行と消えた行をプロジェクトへ送るのに使う。
+    /// 行番号は編集で動くので、ここでは持たない。
+    pub fn entry_todo_rows(&self, entry_idx: usize) -> Vec<(String, String, TaskStatus)> {
+        let Some(entry) = self.entries.get(entry_idx) else {
+            return Vec::new();
+        };
+        if !self.is_todo(entry) {
+            return Vec::new();
+        }
+        let mut group = String::new();
+        let mut out = Vec::new();
+        for idx in entry.body.clone() {
+            let line = &self.lines[idx];
+            if let Some((status, title)) = parse_task_line(line) {
+                if !title.is_empty() {
+                    out.push((group.clone(), title, status));
+                }
+            } else if let Some(name) = parse_group_line(line) {
+                group = name;
             }
         }
         out
@@ -451,21 +482,38 @@ pub fn build_todo_body(date: chrono::NaiveDate, groups: &[(&str, Vec<&ProjectTas
 /// Acta の upsertProjectTasksInTodoBody と同じ考え方で、
 /// - 同じタイトルの行があればチェック欄だけ更新する
 /// - 無いものは `append` が立っているときだけ足す
-/// - ToDo 側にしかない行は消さない（手で足した予定を守る）
+/// - `dropped` に挙げた行はそのグループから消す
+/// - それ以外で ToDo 側にしかない行は消さない（手で足した予定を守る）
 ///
-/// 戻り値は (新しい本文の行, 足した件数, 状態を変えた件数)。
+/// 戻り値は (新しい本文の行, 足した件数, 状態を変えた件数, 消した件数)。
 pub fn upsert_todo_group(
     lines: &[String],
     project_name: &str,
     tasks: &[(TaskStatus, String, bool)],
-) -> (Vec<String>, usize, usize) {
+    dropped: &[String],
+) -> (Vec<String>, usize, usize, usize) {
     let mut out: Vec<String> = lines.to_vec();
+    // 先にプロジェクトから消えた行を落とす。残る行の位置がずれないよう、後ろから消す。
+    let mut removed = 0;
+    if !dropped.is_empty() {
+        if let Some(group) = find_todo_group(&out, project_name) {
+            let targets: Vec<usize> = (group.start + 1..group.end)
+                .filter(|at| {
+                    parse_task_line(&out[*at]).is_some_and(|(_, title)| dropped.contains(&title))
+                })
+                .collect();
+            for at in targets.into_iter().rev() {
+                out.remove(at);
+                removed += 1;
+            }
+        }
+    }
     let Some(group) = find_todo_group(&out, project_name) else {
         // グループごと無いので、足すものだけ並べて末尾に置く。
         let adding: Vec<&(TaskStatus, String, bool)> =
             tasks.iter().filter(|(_, _, append)| *append).collect();
         if adding.is_empty() {
-            return (out, 0, 0);
+            return (out, 0, 0, removed);
         }
         while out.last().is_some_and(|l| l.trim().is_empty()) {
             out.pop();
@@ -477,7 +525,7 @@ pub fn upsert_todo_group(
                 status.marker()
             ));
         }
-        return (out, adding.len(), 0);
+        return (out, adding.len(), 0, removed);
     };
 
     // グループ内の既存タスクをタイトルで引けるようにする。
@@ -517,7 +565,7 @@ pub fn upsert_todo_group(
             .collect();
         out.splice(group.end..group.end, rows);
     }
-    (out, added, updated)
+    (out, added, updated, removed)
 }
 
 /// `- プロジェクト名` の行と、その配下が続く範囲。
@@ -867,10 +915,11 @@ mod tests {
 
     #[test]
     fn adds_new_tasks_to_an_existing_group() {
-        let (out, added, updated) = upsert_todo_group(
+        let (out, added, updated, _) = upsert_todo_group(
             &to_lines(TODO_BODY),
             "プロジェクト A",
             &[(TaskStatus::InProgress, "新しい作業".into(), true)],
+            &[],
         );
         assert_eq!((added, updated), (1, 0));
         // グループの末尾に入り、次のグループは動かない。
@@ -889,10 +938,11 @@ mod tests {
     /// 同じタイトルの行はチェック欄だけ変える。二重に足さない。
     #[test]
     fn updates_the_marker_of_an_existing_task() {
-        let (out, added, updated) = upsert_todo_group(
+        let (out, added, updated, _) = upsert_todo_group(
             &to_lines(TODO_BODY),
             "プロジェクト A",
             &[(TaskStatus::Done, "進行中の作業".into(), true)],
+            &[],
         );
         assert_eq!((added, updated), (0, 1));
         assert!(out.join("\n").contains("  - [x] 進行中の作業"));
@@ -902,10 +952,11 @@ mod tests {
     /// ToDo 側にしか無い行は残す。手で足した予定を消さない。
     #[test]
     fn keeps_rows_that_only_exist_in_the_todo() {
-        let (out, _, _) = upsert_todo_group(
+        let (out, _, _, _) = upsert_todo_group(
             &to_lines(TODO_BODY),
             "プロジェクト A",
             &[(TaskStatus::InProgress, "進行中の作業".into(), true)],
+            &[],
         );
         assert!(out.join("\n").contains("- [ ] 手で足した予定"));
     }
@@ -913,10 +964,11 @@ mod tests {
     /// append が false のものは、既存行の更新だけで新しくは足さない。
     #[test]
     fn does_not_append_when_not_requested() {
-        let (out, added, _) = upsert_todo_group(
+        let (out, added, _, _) = upsert_todo_group(
             &to_lines(TODO_BODY),
             "プロジェクト A",
             &[(TaskStatus::Done, "完了した別の作業".into(), false)],
+            &[],
         );
         assert_eq!(added, 0);
         assert!(!out.join("\n").contains("完了した別の作業"));
@@ -925,10 +977,11 @@ mod tests {
     /// グループが無ければ末尾に作る。
     #[test]
     fn creates_a_group_when_missing() {
-        let (out, added, _) = upsert_todo_group(
+        let (out, added, _, _) = upsert_todo_group(
             &to_lines(TODO_BODY),
             "新しいプロジェクト",
             &[(TaskStatus::InProgress, "作業".into(), true)],
+            &[],
         );
         assert_eq!(added, 1);
         assert!(out
@@ -940,10 +993,11 @@ mod tests {
     #[test]
     fn creates_nothing_when_there_is_nothing_to_add() {
         let before = to_lines(TODO_BODY);
-        let (out, added, updated) = upsert_todo_group(
+        let (out, added, updated, _) = upsert_todo_group(
             &before,
             "新しいプロジェクト",
             &[(TaskStatus::Done, "完了".into(), false)],
+            &[],
         );
         assert_eq!((added, updated), (0, 0));
         assert_eq!(out, before);
@@ -952,10 +1006,11 @@ mod tests {
     /// 見出しだけの ToDo にも足せる。
     #[test]
     fn adds_to_a_heading_only_todo() {
-        let (out, added, _) = upsert_todo_group(
+        let (out, added, _, _) = upsert_todo_group(
             &to_lines("# ToDo: 2026/08/26（水）"),
             "プロジェクト",
             &[(TaskStatus::InProgress, "作業".into(), true)],
+            &[],
         );
         assert_eq!(added, 1);
         assert_eq!(
